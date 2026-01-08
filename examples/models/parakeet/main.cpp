@@ -6,9 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -33,6 +35,10 @@ DEFINE_string(
     data_path,
     "",
     "Path to data file (.ptd) for delegate data (optional, required for CUDA).");
+DEFINE_bool(
+    timestamps,
+    false,
+    "Output subword-, word-, and segment-level timestamps (requires model metadata).");
 
 using ::executorch::extension::from_blob;
 using ::executorch::extension::Module;
@@ -41,10 +47,269 @@ using ::executorch::runtime::EValue;
 
 namespace {
 
-// TDT duration values
+// TDT duration values (Comes from model config in NeMo implementation)
+// https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/models/rnnt_models.py#L230-L238
 const std::vector<int> DURATIONS = {0, 1, 2, 3, 4};
 
-std::vector<int64_t> greedy_decode_executorch(
+struct TokenTimestamp {
+  int64_t id;
+  int64_t start_offset; // encoder frame index
+  int64_t end_offset; // encoder frame index
+};
+
+struct SubwordTimestamp {
+  std::string text;
+  int64_t start_offset;
+  int64_t end_offset;
+  double start_sec;
+  double end_sec;
+};
+
+struct WordTimestamp {
+  std::string text;
+  int64_t start_offset;
+  int64_t end_offset;
+  double start_sec;
+  double end_sec;
+};
+
+struct SegmentTimestamp {
+  std::string text;
+  int64_t start_offset;
+  int64_t end_offset;
+  double start_sec;
+  double end_sec;
+};
+
+bool is_ascii_punctuation_only(const std::string& s) {
+  if (s.empty()) {
+    return false;
+  }
+  for (unsigned char ch : s) {
+    if (!std::ispunct(ch)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+size_t ltrim_ascii_whitespace(const std::string& s) {
+  size_t i = 0;
+  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) {
+    i++;
+  }
+  return i;
+}
+
+std::vector<SubwordTimestamp> tokens_to_subword_timestamps(
+    const std::vector<TokenTimestamp>& tokens,
+    tokenizers::Tokenizer* tokenizer,
+    double seconds_per_encoder_frame) {
+  // NeMo reference of TDT per-token "char" timestamp computation:
+  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L991
+  std::vector<SubwordTimestamp> subwords;
+  if (!tokenizer) {
+    return subwords;
+  }
+
+  const uint64_t bos_token = tokenizer->bos_tok();
+  int64_t prev_end_offset = 0;
+  bool has_prev_end_offset = false;
+
+  for (const auto& token_ts : tokens) {
+    uint64_t token = static_cast<uint64_t>(token_ts.id);
+    auto decode_result = tokenizer->decode(bos_token, token);
+
+    std::string piece =
+        decode_result.ok() ? decode_result.get() : std::string();
+
+    TokenTimestamp adjusted = token_ts;
+    size_t non_ws = ltrim_ascii_whitespace(piece);
+    std::string trimmed_piece = piece.substr(non_ws);
+
+    const bool is_punct = is_ascii_punctuation_only(trimmed_piece);
+    if (is_punct && has_prev_end_offset) {
+      adjusted.start_offset = prev_end_offset;
+      adjusted.end_offset = prev_end_offset;
+    }
+
+    double start_sec = -1.0;
+    double end_sec = -1.0;
+    if (seconds_per_encoder_frame > 0.0) {
+      start_sec = seconds_per_encoder_frame * adjusted.start_offset;
+      end_sec = seconds_per_encoder_frame * adjusted.end_offset;
+    }
+
+    subwords.push_back(
+        SubwordTimestamp{
+            piece,
+            adjusted.start_offset,
+            adjusted.end_offset,
+            start_sec,
+            end_sec});
+
+    prev_end_offset = adjusted.end_offset;
+    has_prev_end_offset = true;
+  }
+
+  return subwords;
+}
+
+std::vector<WordTimestamp> tokens_to_word_timestamps(
+    const std::vector<TokenTimestamp>& tokens,
+    tokenizers::Tokenizer* tokenizer,
+    double seconds_per_encoder_frame) {
+  // NeMo reference for word grouping (subword/char offsets -> word offsets):
+  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L54-L224
+  std::vector<WordTimestamp> words;
+  if (!tokenizer || tokens.empty()) {
+    return words;
+  }
+
+  uint64_t prev_token = 0;
+
+  std::string current_word;
+  int64_t current_start_offset = 0;
+  int64_t current_end_offset = 0;
+  int64_t prev_end_offset = 0;
+  bool has_prev_end_offset = false;
+
+  auto emit_word = [&]() {
+    if (current_word.empty()) {
+      return;
+    }
+    double start_sec = -1.0;
+    double end_sec = -1.0;
+    if (seconds_per_encoder_frame > 0.0) {
+      start_sec = seconds_per_encoder_frame * current_start_offset;
+      end_sec = seconds_per_encoder_frame * current_end_offset;
+    }
+    words.push_back(
+        WordTimestamp{
+            current_word,
+            current_start_offset,
+            current_end_offset,
+            start_sec,
+            end_sec});
+    current_word.clear();
+  };
+
+  for (const auto& token_ts : tokens) {
+    uint64_t token = static_cast<uint64_t>(token_ts.id);
+    auto decode_result = tokenizer->decode(prev_token, token);
+    prev_token = token;
+
+    std::string piece =
+        decode_result.ok() ? decode_result.get() : std::string();
+    size_t non_ws = ltrim_ascii_whitespace(piece);
+    bool had_leading_ws = non_ws > 0;
+    std::string trimmed_piece = piece.substr(non_ws);
+
+    if (trimmed_piece.empty()) {
+      continue;
+    }
+
+    // TDT sometimes emits punctuation long after preceding token. Thus, pin to
+    // previous token. NeMo applies the same correction:
+    // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L1169-L1189
+    // Divergence: NeMo consults `supported_punctuation` from the model; here we
+    // approximate with `is_ascii_punctuation_only()`.
+    TokenTimestamp adjusted = token_ts;
+    const bool is_punct = is_ascii_punctuation_only(trimmed_piece);
+    if (is_punct && has_prev_end_offset) {
+      adjusted.start_offset = prev_end_offset;
+      adjusted.end_offset = prev_end_offset;
+    }
+
+    if (current_word.empty()) {
+      current_word = trimmed_piece;
+      current_start_offset = adjusted.start_offset;
+      current_end_offset = adjusted.end_offset;
+    } else if (had_leading_ws && !is_punct) {
+      // NeMo builds words from decoded token offsets w/ tokenizer-aware rules:
+      // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L79-L99
+      // Here, just build words per-token and separate by leading whitespace
+      emit_word();
+      current_word = trimmed_piece;
+      current_start_offset = adjusted.start_offset;
+      current_end_offset = adjusted.end_offset;
+    } else {
+      current_word += trimmed_piece;
+      current_end_offset = adjusted.end_offset;
+    }
+
+    prev_end_offset = adjusted.end_offset;
+    has_prev_end_offset = true;
+  }
+
+  emit_word();
+  return words;
+}
+
+std::vector<SegmentTimestamp> words_to_segment_timestamps(
+    const std::vector<WordTimestamp>& words,
+    double seconds_per_encoder_frame) {
+  // NeMo reference for segment grouping (word offsets -> segment offsets):
+  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L227-L327
+  std::vector<SegmentTimestamp> segments;
+  if (words.empty()) {
+    return segments;
+  }
+
+  std::string current_segment;
+  int64_t segment_start_offset = 0;
+  int64_t segment_end_offset = 0;
+  bool has_segment = false;
+
+  auto emit_segment = [&]() {
+    if (!has_segment || current_segment.empty()) {
+      return;
+    }
+    double start_sec = -1.0;
+    double end_sec = -1.0;
+    if (seconds_per_encoder_frame > 0.0) {
+      start_sec = seconds_per_encoder_frame * segment_start_offset;
+      end_sec = seconds_per_encoder_frame * segment_end_offset;
+    }
+    segments.push_back(
+        SegmentTimestamp{
+            current_segment,
+            segment_start_offset,
+            segment_end_offset,
+            start_sec,
+            end_sec});
+    current_segment.clear();
+    has_segment = false;
+  };
+
+  for (const auto& word : words) {
+    if (!has_segment) {
+      has_segment = true;
+      current_segment = word.text;
+      segment_start_offset = word.start_offset;
+      segment_end_offset = word.end_offset;
+    } else {
+      current_segment += " ";
+      current_segment += word.text;
+      segment_end_offset = word.end_offset;
+    }
+
+    if (!word.text.empty()) {
+      char last = word.text.back();
+      // NeMo Divergence: we only segment on terminal punctuation (.,!,?) rather
+      // than configurable segment_delimiter_tokens. Also no
+      // `segment_gap_threshold` splitting.
+      if (last == '.' || last == '!' || last == '?') {
+        emit_segment();
+      }
+    }
+  }
+
+  emit_segment();
+  return segments;
+}
+
+std::vector<TokenTimestamp> greedy_decode_executorch(
     Module& model,
     const ::executorch::aten::Tensor& encoder_output,
     int64_t encoder_len,
@@ -53,7 +318,7 @@ std::vector<int64_t> greedy_decode_executorch(
     int64_t num_rnn_layers = 2,
     int64_t pred_hidden = 640,
     int64_t max_symbols_per_step = 10) {
-  std::vector<int64_t> hypothesis;
+  std::vector<TokenTimestamp> hypothesis;
   int64_t num_token_classes = vocab_size + 1;
 
   // Transpose encoder output from [1, enc_dim, time] to [1, time, enc_dim]
@@ -108,9 +373,9 @@ std::vector<int64_t> greedy_decode_executorch(
   // Prime the prediction network state with SOS (= blank_id) to match NeMo TDT
   // greedy label-looping decoding behavior:
   // - SOS is defined as blank:
-  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c980b70cecc184fa8a083a9c3ddb87f905e/nemo/collections/asr/parts/submodules/transducer_decoding/tdt_label_looping.py#L250
+  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/transducer_decoding/tdt_label_looping.py#L250
   // - Predictor priming with SOS:
-  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c980b70cecc184fa8a083a9c3ddb87f905e/nemo/collections/asr/parts/submodules/transducer_decoding/tdt_label_looping.py#L363-L368
+  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/transducer_decoding/tdt_label_looping.py#L363-L368
   std::vector<int64_t> sos_token_data = {blank_id};
   auto sos_token = from_blob(
       sos_token_data.data(), {1, 1}, ::executorch::aten::ScalarType::Long);
@@ -208,7 +473,7 @@ std::vector<int64_t> greedy_decode_executorch(
       t += std::max(dur, (int64_t)1);
       symbols_on_frame = 0;
     } else {
-      hypothesis.push_back(k);
+      hypothesis.push_back(TokenTimestamp{k, t, t + dur});
 
       // Update decoder state
       std::vector<int64_t> token_data = {k};
@@ -431,8 +696,77 @@ int main(int argc, char** argv) {
   }
 
   // Convert tokens to text
-  std::string text = tokens_to_text(tokens, tokenizer.get());
+  std::vector<int64_t> token_ids;
+  token_ids.reserve(tokens.size());
+  for (const auto& t : tokens) {
+    token_ids.push_back(t.id);
+  }
+  std::string text = tokens_to_text(token_ids, tokenizer.get());
   std::cout << "Transcription tokens: " << text << std::endl;
+
+  if (FLAGS_timestamps) {
+    std::vector<::executorch::runtime::EValue> empty_inputs;
+    auto window_stride_result = model->execute("window_stride", empty_inputs);
+    auto subsampling_factor_result =
+        model->execute("encoder_subsampling_factor", empty_inputs);
+
+    double seconds_per_encoder_frame = -1.0;
+    if (window_stride_result.ok() && subsampling_factor_result.ok()) {
+      double window_stride = window_stride_result.get()[0].toDouble();
+      int64_t encoder_subsampling_factor =
+          subsampling_factor_result.get()[0].toInt();
+      seconds_per_encoder_frame = window_stride * encoder_subsampling_factor;
+      ET_LOG(
+          Info,
+          "Timestamp metadata: window_stride=%f, encoder_subsampling_factor=%lld, seconds_per_encoder_frame=%f",
+          window_stride,
+          static_cast<long long>(encoder_subsampling_factor),
+          seconds_per_encoder_frame);
+    } else {
+      ET_LOG(
+          Error,
+          "Timestamps requested but model metadata is missing. Re-export the model with constant_methods for window_stride and encoder_subsampling_factor.");
+      return 1;
+    }
+
+    auto subwords = tokens_to_subword_timestamps(
+        tokens, tokenizer.get(), seconds_per_encoder_frame);
+    auto words = tokens_to_word_timestamps(
+        tokens, tokenizer.get(), seconds_per_encoder_frame);
+    auto segments =
+        words_to_segment_timestamps(words, seconds_per_encoder_frame);
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\nSubword timestamps:\n";
+    for (const auto& sw : subwords) {
+      if (seconds_per_encoder_frame > 0.0) {
+        std::cout << "[" << sw.start_sec << ", " << sw.end_sec << "] ";
+      } else {
+        std::cout << "[" << sw.start_offset << ", " << sw.end_offset << "] ";
+      }
+      std::cout << sw.text << "\n";
+    }
+
+    std::cout << "\nWord timestamps:\n";
+    for (const auto& w : words) {
+      if (seconds_per_encoder_frame > 0.0) {
+        std::cout << "[" << w.start_sec << ", " << w.end_sec << "] ";
+      } else {
+        std::cout << "[" << w.start_offset << ", " << w.end_offset << "] ";
+      }
+      std::cout << w.text << "\n";
+    }
+
+    std::cout << "\nSegment timestamps:\n";
+    for (const auto& s : segments) {
+      if (seconds_per_encoder_frame > 0.0) {
+        std::cout << "[" << s.start_sec << ", " << s.end_sec << "] ";
+      } else {
+        std::cout << "[" << s.start_offset << ", " << s.end_offset << "] ";
+      }
+      std::cout << s.text << "\n";
+    }
+  }
 
   ET_LOG(Info, "Done!");
   return 0;
