@@ -49,12 +49,32 @@ namespace {
 
 // TDT duration values
 const std::vector<int> DURATIONS = {0, 1, 2, 3, 4};
+// NeMo: TDT maps a duration-class argmax -> "skip" (advance) in encoder frames.
+// - Viable duration choices come from loss/config into decoding_cfg.durations:
+//   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/models/rnnt_models.py#L230-L238
+// - Greedy TDT decoding uses: skip = self.durations[d_k]
+//   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L2665-L2669
+// Divergence: we hardcode {0,1,2,3,4} here (matches current Parakeet TDT
+// export). If the exported model's duration set changes, this must be updated
+// to match or timestamps/decoding will drift.
 
 struct TokenTimestamp {
   int64_t id;
   int64_t start_offset; // encoder frame index
   int64_t end_offset; // encoder frame index
 };
+// NeMo: TDT timing is represented on the Hypothesis as two parallel lists:
+// - `Hypothesis.timestamp` holds the encoder frame index where each non-blank
+//   token was emitted.
+// - `Hypothesis.token_duration` holds the predicted duration/skip for that token.
+// These are later converted to `{start_offset, end_offset}` via
+// RNNTDecoding._compute_offsets_tdt().
+// - Where NeMo records `timestamp` + `token_duration` during greedy TDT decode:
+//   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L2604-L2693
+// - Where NeMo converts them into offsets:
+//   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L1128-L1156
+// Divergence: this ExecuTorch example stores `{start_offset,end_offset}` directly
+// as it decodes. We don't preserve NeMo's intermediate `timestep` list.
 
 struct WordTimestamp {
   std::string text;
@@ -63,6 +83,13 @@ struct WordTimestamp {
   double start_sec;
   double end_sec;
 };
+// NeMo: word-level timestamps are built from per-token offsets with
+// `get_words_offsets()` and then converted from offsets->seconds by
+// `process_timestamp_outputs()`.
+// - Word grouping: https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L54-L224
+// - Offsets->seconds: https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L428-L479
+// Divergence: we only implement word + segment timestamps in this example (no
+// char/subword timestamps).
 
 struct SegmentTimestamp {
   std::string text;
@@ -71,8 +98,20 @@ struct SegmentTimestamp {
   double start_sec;
   double end_sec;
 };
+// NeMo: segment-level timestamps are built from word offsets with
+// `get_segment_offsets()`.
+//   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L227-L327
+// Divergence: we only segment on terminal punctuation (.,!,?) and do not
+// implement NeMo's optional `segment_gap_threshold` behavior.
 
 bool is_ascii_punctuation_only(const std::string& s) {
+  // NeMo: TDT punctuation timestamp refinement is applied when a punctuation
+  // token appears long after the previous token; NeMo "pins" punctuation to the
+  // previous token's end offset.
+  //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L1169-L1189
+  // Divergence: NeMo checks membership in a model-specific `supported_punctuation`
+  // set (can include non-ASCII). Here we approximate by checking ASCII
+  // `std::ispunct()` on bytes.
   if (s.empty()) {
     return false;
   }
@@ -85,6 +124,11 @@ bool is_ascii_punctuation_only(const std::string& s) {
 }
 
 size_t ltrim_ascii_whitespace(const std::string& s) {
+  // NeMo: word boundaries for BPE/WPE are detected via tokenizer-type-specific
+  // logic in `get_words_offsets()` (word delimiter char, special markers, etc).
+  //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L79-L99
+  // Divergence: we treat leading *ASCII whitespace* in the decoded piece as the
+  // only word boundary signal.
   size_t i = 0;
   while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) {
     i++;
@@ -96,6 +140,15 @@ std::vector<WordTimestamp> tokens_to_word_timestamps(
     const std::vector<TokenTimestamp>& tokens,
     tokenizers::Tokenizer* tokenizer,
     double seconds_per_encoder_frame) {
+  // NeMo reference for word grouping (subword/char offsets -> word offsets):
+  //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L54-L224
+  //
+  // Divergences from NeMo:
+  // - NeMo builds words from decoded token offsets (and handles tokenizer types);
+  //   here we build words by incrementally decoding each token and using leading
+  //   ASCII whitespace as the boundary.
+  // - NeMo returns `Hypothesis.timestamp['char']` in addition to word/segment;
+  //   this example does not generate char/subword timestamps.
   std::vector<WordTimestamp> words;
   if (!tokenizer || tokens.empty()) {
     return words;
@@ -143,6 +196,10 @@ std::vector<WordTimestamp> tokens_to_word_timestamps(
     if (is_punct && has_prev_end_offset) {
       // TDT can sometimes emit punctuation long after the preceding word. Pin
       // punctuation timing to the previous token end.
+      // NeMo: RNNTDecoding._refine_timestamps_tdt() applies the same correction:
+      //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L1169-L1189
+      // Divergence: NeMo consults `supported_punctuation` from the model; here we
+      // approximate punctuation detection (ASCII-only) via `is_ascii_punctuation_only()`.
       adjusted.start_offset = prev_end_offset;
       adjusted.end_offset = prev_end_offset;
     }
@@ -152,6 +209,11 @@ std::vector<WordTimestamp> tokens_to_word_timestamps(
       current_start_offset = adjusted.start_offset;
       current_end_offset = adjusted.end_offset;
     } else if (had_leading_ws && !is_punct) {
+      // NeMo: `get_words_offsets()` decides when a new word starts using
+      // tokenizer-aware rules (delimiter markers, WPE "##" prefixes, etc):
+      //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L79-L99
+      // Divergence: our boundary rule is strictly "decoded piece had leading
+      // ASCII whitespace and is not punctuation".
       emit_word();
       current_word = trimmed_piece;
       current_start_offset = adjusted.start_offset;
@@ -172,6 +234,10 @@ std::vector<WordTimestamp> tokens_to_word_timestamps(
 std::vector<SegmentTimestamp> words_to_segment_timestamps(
     const std::vector<WordTimestamp>& words,
     double seconds_per_encoder_frame) {
+  // NeMo reference for segment grouping (word offsets -> segment offsets):
+  //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L227-L327
+  // Divergence: we only segment on terminal punctuation (.,!,?) and do not
+  // implement NeMo's optional `segment_gap_threshold` splitting.
   std::vector<SegmentTimestamp> segments;
   if (words.empty()) {
     return segments;
@@ -213,6 +279,8 @@ std::vector<SegmentTimestamp> words_to_segment_timestamps(
     if (!word.text.empty()) {
       char last = word.text.back();
       if (last == '.' || last == '!' || last == '?') {
+        // NeMo: segment delimiters are configurable (default includes '.', '?', '!'):
+        //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L287-L296
         emit_segment();
       }
     }
@@ -231,6 +299,19 @@ std::vector<TokenTimestamp> greedy_decode_executorch(
     int64_t num_rnn_layers = 2,
     int64_t pred_hidden = 640,
     int64_t max_symbols_per_step = 10) {
+  // NeMo reference for greedy TDT decoding (where the *token timing* originates):
+  // - Core greedy TDT loop (token argmax + duration argmax + skip advance):
+  //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L2627-L2717
+  // - NeMo records per-token `timestamp` + `token_duration` here:
+  //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L2684-L2693
+  //
+  // Divergences from NeMo:
+  // - We implement a single-item (B=1) decoder loop directly over ExecuTorch
+  //   exported methods (`joint_project_*`, `decoder_predict`, `joint`).
+  // - We take argmax directly on raw logits (no log_softmax); this matches
+  //   NeMo's argmax choice but we do not compute scores/confidence.
+  // - NeMo's loop structure uses an explicit inner loop for `skip==0` label
+  //   looping; here we emulate it with `dur==0` and `symbols_on_frame`.
   std::vector<TokenTimestamp> hypothesis;
   int64_t num_token_classes = vocab_size + 1;
 
@@ -286,9 +367,9 @@ std::vector<TokenTimestamp> greedy_decode_executorch(
   // Prime the prediction network state with SOS (= blank_id) to match NeMo TDT
   // greedy label-looping decoding behavior:
   // - SOS is defined as blank:
-  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c980b70cecc184fa8a083a9c3ddb87f905e/nemo/collections/asr/parts/submodules/transducer_decoding/tdt_label_looping.py#L250
+  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/transducer_decoding/tdt_label_looping.py#L250
   // - Predictor priming with SOS:
-  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c980b70cecc184fa8a083a9c3ddb87f905e/nemo/collections/asr/parts/submodules/transducer_decoding/tdt_label_looping.py#L363-L368
+  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/transducer_decoding/tdt_label_looping.py#L363-L368
   std::vector<int64_t> sos_token_data = {blank_id};
   auto sos_token = from_blob(
       sos_token_data.data(), {1, 1}, ::executorch::aten::ScalarType::Long);
@@ -383,9 +464,20 @@ std::vector<TokenTimestamp> greedy_decode_executorch(
     int64_t dur = DURATIONS[dur_idx];
 
     if (k == blank_id) {
+      // NeMo: if blank is emitted with duration=0, it forces progress to avoid
+      // infinite loops (skip==0 -> skip=1):
+      //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L2700-L2704
+      // Divergence: NeMo advances `time_idx += skip` first and patches `skip`
+      // after the inner loop; here we apply `max(dur,1)` immediately in the
+      // blank branch.
       t += std::max(dur, (int64_t)1);
       symbols_on_frame = 0;
     } else {
+      // NeMo: emits token at `time_idx` and stores duration separately:
+      //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L2684-L2693
+      // NeMo later converts (timestamp, token_duration) -> (start_offset, end_offset):
+      //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L1128-L1156
+      // Divergence: we store (start_offset=t, end_offset=t+dur) directly.
       hypothesis.push_back(TokenTimestamp{k, t, t + dur});
 
       // Update decoder state
@@ -432,6 +524,12 @@ std::vector<TokenTimestamp> greedy_decode_executorch(
       t += dur;
 
       if (dur == 0) {
+        // NeMo: label looping occurs when `skip == 0` (stay on same encoder frame)
+        // until a non-zero skip is predicted, capped by `max_symbols_per_step`:
+        // - need_loop = (skip == 0):
+        //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L2695-L2699
+        // - force progress after max symbols:
+        //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L2715-L2716
         symbols_on_frame++;
         if (symbols_on_frame >= max_symbols_per_step) {
           t++;
@@ -618,6 +716,15 @@ int main(int argc, char** argv) {
   std::cout << "Transcription tokens: " << text << std::endl;
 
   if (FLAGS_timestamps) {
+    // NeMo: offset->seconds conversion uses
+    //   start = start_offset * window_stride * subsampling_factor
+    //   end   = end_offset   * window_stride * subsampling_factor
+    //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L428-L479
+    //
+    // Divergence: NeMo reads `window_stride` from the preprocessor config and
+    // `subsampling_factor` from the encoder module. In ExecuTorch we require
+    // these values to be exported as `constant_methods` (`window_stride` and
+    // `encoder_subsampling_factor`). If unavailable, we print raw offsets.
     std::vector<::executorch::runtime::EValue> empty_inputs;
     auto window_stride_result = model->execute("window_stride", empty_inputs);
     auto subsampling_factor_result =
