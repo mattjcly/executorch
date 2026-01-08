@@ -47,7 +47,7 @@ using ::executorch::runtime::EValue;
 
 namespace {
 
-// TDT duration values (hardcoded for simplicity, comes from model config in NeMo implementation)
+// TDT duration values (Comes from model config in NeMo implementation)
 // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/models/rnnt_models.py#L230-L238
 const std::vector<int> DURATIONS = {0, 1, 2, 3, 4};
 
@@ -120,7 +120,8 @@ std::vector<SubwordTimestamp> tokens_to_subword_timestamps(
     uint64_t token = static_cast<uint64_t>(token_ts.id);
     auto decode_result = tokenizer->decode(bos_token, token);
 
-    std::string piece = decode_result.ok() ? decode_result.get() : std::string();
+    std::string piece =
+        decode_result.ok() ? decode_result.get() : std::string();
 
     TokenTimestamp adjusted = token_ts;
     size_t non_ws = ltrim_ascii_whitespace(piece);
@@ -139,8 +140,13 @@ std::vector<SubwordTimestamp> tokens_to_subword_timestamps(
       end_sec = seconds_per_encoder_frame * adjusted.end_offset;
     }
 
-    subwords.push_back(SubwordTimestamp{
-        piece, adjusted.start_offset, adjusted.end_offset, start_sec, end_sec});
+    subwords.push_back(
+        SubwordTimestamp{
+            piece,
+            adjusted.start_offset,
+            adjusted.end_offset,
+            start_sec,
+            end_sec});
 
     prev_end_offset = adjusted.end_offset;
     has_prev_end_offset = true;
@@ -178,8 +184,13 @@ std::vector<WordTimestamp> tokens_to_word_timestamps(
       start_sec = seconds_per_encoder_frame * current_start_offset;
       end_sec = seconds_per_encoder_frame * current_end_offset;
     }
-    words.push_back(WordTimestamp{
-        current_word, current_start_offset, current_end_offset, start_sec, end_sec});
+    words.push_back(
+        WordTimestamp{
+            current_word,
+            current_start_offset,
+            current_end_offset,
+            start_sec,
+            end_sec});
     current_word.clear();
   };
 
@@ -188,7 +199,8 @@ std::vector<WordTimestamp> tokens_to_word_timestamps(
     auto decode_result = tokenizer->decode(prev_token, token);
     prev_token = token;
 
-    std::string piece = decode_result.ok() ? decode_result.get() : std::string();
+    std::string piece =
+        decode_result.ok() ? decode_result.get() : std::string();
     size_t non_ws = ltrim_ascii_whitespace(piece);
     bool had_leading_ws = non_ws > 0;
     std::string trimmed_piece = piece.substr(non_ws);
@@ -197,11 +209,11 @@ std::vector<WordTimestamp> tokens_to_word_timestamps(
       continue;
     }
 
-    // TDT sometimes emits punctuation long after preceding token. Thus, pin to previous token.
-    // NeMo applies the same correction:
+    // TDT sometimes emits punctuation long after preceding token. Thus, pin to
+    // previous token. NeMo applies the same correction:
     // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L1169-L1189
     // Divergence: NeMo consults `supported_punctuation` from the model; here we
-    // approximate punctuation detection (ASCII-only) via `is_ascii_punctuation_only()`.
+    // approximate with `is_ascii_punctuation_only()`.
     TokenTimestamp adjusted = token_ts;
     const bool is_punct = is_ascii_punctuation_only(trimmed_piece);
     if (is_punct && has_prev_end_offset) {
@@ -216,7 +228,7 @@ std::vector<WordTimestamp> tokens_to_word_timestamps(
     } else if (had_leading_ws && !is_punct) {
       // NeMo builds words from decoded token offsets w/ tokenizer-aware rules:
       // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L79-L99
-      // Here we simplify, building words per-token and using leading whitespace as the boundary.
+      // Here, just build words per-token and separate by leading whitespace
       emit_word();
       current_word = trimmed_piece;
       current_start_offset = adjusted.start_offset;
@@ -259,8 +271,13 @@ std::vector<SegmentTimestamp> words_to_segment_timestamps(
       start_sec = seconds_per_encoder_frame * segment_start_offset;
       end_sec = seconds_per_encoder_frame * segment_end_offset;
     }
-    segments.push_back(SegmentTimestamp{
-        current_segment, segment_start_offset, segment_end_offset, start_sec, end_sec});
+    segments.push_back(
+        SegmentTimestamp{
+            current_segment,
+            segment_start_offset,
+            segment_end_offset,
+            start_sec,
+            end_sec});
     current_segment.clear();
     has_segment = false;
   };
@@ -279,8 +296,9 @@ std::vector<SegmentTimestamp> words_to_segment_timestamps(
 
     if (!word.text.empty()) {
       char last = word.text.back();
-      // NeMo Divergence: we only segment on terminal punctuation (.,!,?) rather than configurable
-      // segment_delimiter_tokens. Also no `segment_gap_threshold` splitting.
+      // NeMo Divergence: we only segment on terminal punctuation (.,!,?) rather
+      // than configurable segment_delimiter_tokens. Also no
+      // `segment_gap_threshold` splitting.
       if (last == '.' || last == '!' || last == '?') {
         emit_segment();
       }
@@ -711,16 +729,14 @@ int main(int argc, char** argv) {
       return 1;
     }
 
+    auto subwords = tokens_to_subword_timestamps(
+        tokens, tokenizer.get(), seconds_per_encoder_frame);
     auto words = tokens_to_word_timestamps(
         tokens, tokenizer.get(), seconds_per_encoder_frame);
     auto segments =
         words_to_segment_timestamps(words, seconds_per_encoder_frame);
 
     std::cout << std::fixed << std::setprecision(2);
-
-    auto subwords = tokens_to_subword_timestamps(
-        tokens, tokenizer.get(), seconds_per_encoder_frame);
-
     std::cout << "\nSubword timestamps:\n";
     for (const auto& sw : subwords) {
       if (seconds_per_encoder_frame > 0.0) {

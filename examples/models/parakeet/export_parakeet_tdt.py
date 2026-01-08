@@ -352,7 +352,7 @@ def export_all(model):
 
     sample_rate = model.preprocessor._cfg.sample_rate
     window_stride = float(model.preprocessor._cfg.window_stride)
-    encoder_subsampling_factor = int(getattr(model.encoder, "subsampling_factor", 1))
+    encoder_subsampling_factor = int(getattr(model.encoder, "subsampling_factor", 8))
     metadata = {
         "num_rnn_layers": num_layers,
         "pred_hidden": pred_hidden,
