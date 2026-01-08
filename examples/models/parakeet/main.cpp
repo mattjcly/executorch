@@ -38,7 +38,7 @@ DEFINE_string(
 DEFINE_bool(
     timestamps,
     false,
-    "Output word- and segment-level timestamps (requires model metadata).");
+    "Output subword-, word-, and segment-level timestamps (requires model metadata).");
 
 using ::executorch::extension::from_blob;
 using ::executorch::extension::Module;
@@ -76,6 +76,14 @@ struct TokenTimestamp {
 // Divergence: this ExecuTorch example stores `{start_offset,end_offset}` directly
 // as it decodes. We don't preserve NeMo's intermediate `timestep` list.
 
+struct SubwordTimestamp {
+  std::string text;
+  int64_t start_offset;
+  int64_t end_offset;
+  double start_sec;
+  double end_sec;
+};
+
 struct WordTimestamp {
   std::string text;
   int64_t start_offset;
@@ -88,8 +96,8 @@ struct WordTimestamp {
 // `process_timestamp_outputs()`.
 // - Word grouping: https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L54-L224
 // - Offsets->seconds: https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L428-L479
-// Divergence: we only implement word + segment timestamps in this example (no
-// char/subword timestamps).
+// Note: NeMo's `timestamp['char']` for Parakeet is per-subword token offsets
+// (not true per-character).
 
 struct SegmentTimestamp {
   std::string text;
@@ -136,6 +144,58 @@ size_t ltrim_ascii_whitespace(const std::string& s) {
   return i;
 }
 
+std::vector<SubwordTimestamp> tokens_to_subword_timestamps(
+    const std::vector<TokenTimestamp>& tokens,
+    tokenizers::Tokenizer* tokenizer,
+    double seconds_per_encoder_frame) {
+  // NeMo reference: TDT per-token "char" timestamps are computed in
+  // `compute_rnnt_timestamps()` via `_compute_offsets_tdt()` and
+  // `_refine_timestamps_tdt()`:
+  //   https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L991
+  // NeMo: "char" timestamps for Parakeet-TDT correspond to per-subword token
+  // offsets, with a TDT punctuation refinement step.
+  std::vector<SubwordTimestamp> subwords;
+  if (!tokenizer) {
+    return subwords;
+  }
+
+  const uint64_t bos_token = tokenizer->bos_tok();
+  int64_t prev_end_offset = 0;
+  bool has_prev_end_offset = false;
+
+  for (const auto& token_ts : tokens) {
+    uint64_t token = static_cast<uint64_t>(token_ts.id);
+    auto decode_result = tokenizer->decode(bos_token, token);
+
+    std::string piece = decode_result.ok() ? decode_result.get() : std::string();
+
+    TokenTimestamp adjusted = token_ts;
+    size_t non_ws = ltrim_ascii_whitespace(piece);
+    std::string trimmed_piece = piece.substr(non_ws);
+
+    const bool is_punct = is_ascii_punctuation_only(trimmed_piece);
+    if (is_punct && has_prev_end_offset) {
+      adjusted.start_offset = prev_end_offset;
+      adjusted.end_offset = prev_end_offset;
+    }
+
+    double start_sec = -1.0;
+    double end_sec = -1.0;
+    if (seconds_per_encoder_frame > 0.0) {
+      start_sec = seconds_per_encoder_frame * adjusted.start_offset;
+      end_sec = seconds_per_encoder_frame * adjusted.end_offset;
+    }
+
+    subwords.push_back(SubwordTimestamp{
+        piece, adjusted.start_offset, adjusted.end_offset, start_sec, end_sec});
+
+    prev_end_offset = adjusted.end_offset;
+    has_prev_end_offset = true;
+  }
+
+  return subwords;
+}
+
 std::vector<WordTimestamp> tokens_to_word_timestamps(
     const std::vector<TokenTimestamp>& tokens,
     tokenizers::Tokenizer* tokenizer,
@@ -148,7 +208,7 @@ std::vector<WordTimestamp> tokens_to_word_timestamps(
   //   here we build words by incrementally decoding each token and using leading
   //   ASCII whitespace as the boundary.
   // - NeMo returns `Hypothesis.timestamp['char']` in addition to word/segment;
-  //   this example does not generate char/subword timestamps.
+  //   this example also emits per-subword timestamps.
   std::vector<WordTimestamp> words;
   if (!tokenizer || tokens.empty()) {
     return words;
@@ -754,6 +814,19 @@ int main(int argc, char** argv) {
         words_to_segment_timestamps(words, seconds_per_encoder_frame);
 
     std::cout << std::fixed << std::setprecision(2);
+
+    auto subwords = tokens_to_subword_timestamps(
+        tokens, tokenizer.get(), seconds_per_encoder_frame);
+
+    std::cout << "\nSubword timestamps:\n";
+    for (const auto& sw : subwords) {
+      if (seconds_per_encoder_frame > 0.0) {
+        std::cout << "[" << sw.start_sec << ", " << sw.end_sec << "] ";
+      } else {
+        std::cout << "[" << sw.start_offset << ", " << sw.end_offset << "] ";
+      }
+      std::cout << sw.text << "\n";
+    }
 
     std::cout << "\nWord timestamps:\n";
     for (const auto& w : words) {
