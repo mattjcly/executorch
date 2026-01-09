@@ -13,10 +13,14 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "sentencepiece_processor.h"
 
 #include <gflags/gflags.h>
 
@@ -31,7 +35,7 @@ DEFINE_string(model_path, "parakeet.pte", "Path to Parakeet model (.pte).");
 DEFINE_string(audio_path, "", "Path to input audio file (.wav).");
 DEFINE_string(
     tokenizer_path,
-    "tokenizer.json",
+    "tokenizer.model",
     "Path to SentencePiece tokenizer model file.");
 DEFINE_string(
     data_path,
@@ -67,61 +71,72 @@ struct TimestampedTextSpan {
   double end_sec;
 };
 
-bool is_ascii_punctuation_only(const std::string_view s) {
-  if (s.empty()) {
-    return false;
+std::vector<std::string> split_lines(const std::string_view s) {
+  std::vector<std::string> lines;
+  size_t start = 0;
+  while (start <= s.size()) {
+    const size_t end = s.find('\n', start);
+    const size_t line_end =
+        (end == std::string_view::npos) ? s.size() : end;
+    const std::string_view line_view = s.substr(start, line_end - start);
+    if (!line_view.empty()) {
+      lines.emplace_back(line_view);
+    }
+    if (end == std::string_view::npos) {
+      break;
+    }
+    start = end + 1;
   }
-  return std::all_of(s.begin(), s.end(), [](const unsigned char ch) {
-    return std::ispunct(ch);
-  });
+  return lines;
 }
 
-size_t ltrim_ascii_whitespace(const std::string_view s) {
-  size_t i = 0;
-  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) {
-    i++;
+std::unordered_set<std::string> split_lines_to_set(const std::string_view s) {
+  std::unordered_set<std::string> out;
+  for (const auto& line : split_lines(s)) {
+    out.insert(line);
   }
-  return i;
+  return out;
 }
 
-struct TokenizerDecodedPiece {
-  std::string piece;
-  size_t trimmed_offset = 0;
-  bool had_leading_whitespace = false;
-
-  std::string_view trimmed_piece() const {
-    std::string_view trimmed(piece);
-    trimmed.remove_prefix(trimmed_offset);
-    return trimmed;
-  }
-};
-
-TokenizerDecodedPiece decode_piece(
-    const tokenizers::Tokenizer& tokenizer,
-    const uint64_t prev_token_id,
-    const uint64_t token_id) {
-  auto decode_result = tokenizer.decode(prev_token_id, token_id);
-  TokenizerDecodedPiece decoded;
-  decoded.piece = decode_result.ok() ? decode_result.get() : std::string();
-  decoded.trimmed_offset = ltrim_ascii_whitespace(decoded.piece);
-  decoded.had_leading_whitespace = decoded.trimmed_offset > 0;
-  return decoded;
+std::string sp_decode_ids(const sentencepiece::SentencePieceProcessor& sp, int id) {
+  std::string out;
+  const auto status = sp.Decode(std::vector<int>{id}, &out);
+  return status.ok() ? out : std::string();
 }
 
-// TDT sometimes emits punctuation long after preceding token. Thus, pin
-// timestamp to previous token. NeMo applies the same correction:
-// https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L1169-L1189
-// Divergence: NeMo consults `supported_punctuation` from the model; here we
-// approximate punctuation detection with `is_ascii_punctuation_only()`.
-Token apply_tdt_punctuation_timestamp_correction(
-    const Token& token,
-    const bool is_punct,
-    const int64_t prev_end_offset,
-    const bool has_prev_end_offset) {
-  if (!is_punct || !has_prev_end_offset) {
-    return token;
+std::string sp_decode_pieces(
+    const sentencepiece::SentencePieceProcessor& sp,
+    const std::vector<std::string>& pieces) {
+  std::string out;
+  const auto status = sp.Decode(pieces, &out);
+  return status.ok() ? out : std::string();
+}
+
+// NeMo TDT punctuation pinning (`_refine_timestamps_tdt`).
+std::vector<Token> apply_tdt_punctuation_timestamp_correction(
+    const std::vector<Token>& tokens,
+    const sentencepiece::SentencePieceProcessor& sp,
+    const std::unordered_set<std::string>& supported_punctuation) {
+  std::vector<Token> corrected;
+  corrected.reserve(tokens.size());
+
+  int64_t prev_end_offset = 0;
+  bool has_prev_end_offset = false;
+
+  for (const auto& token : tokens) {
+    const std::string token_text = sp_decode_ids(sp, static_cast<int>(token.id));
+    const bool is_punct =
+        supported_punctuation.find(token_text) != supported_punctuation.end();
+    if (is_punct && has_prev_end_offset) {
+      corrected.push_back(Token{token.id, prev_end_offset, prev_end_offset});
+    } else {
+      corrected.push_back(token);
+    }
+    prev_end_offset = corrected.back().end_offset;
+    has_prev_end_offset = true;
   }
-  return Token{token.id, prev_end_offset, prev_end_offset};
+
+  return corrected;
 }
 
 struct TimestampOutputMode {
@@ -169,33 +184,20 @@ TimestampOutputMode parse_timestamp_output_mode(const std::string& raw_arg) {
 
 std::vector<TimestampedTextSpan> tokens_to_timestamped_subwords(
     const std::vector<Token>& tokens,
-    const tokenizers::Tokenizer& tokenizer,
+    const sentencepiece::SentencePieceProcessor& sp,
     const double seconds_per_encoder_frame) {
-  // NeMo reference of TDT per-token "char" timestamp computation:
-  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L991
+  // NeMo reference (TDT offsets): RNNTDecoding._compute_offsets_tdt().
   std::vector<TimestampedTextSpan> subwords;
   subwords.reserve(tokens.size());
 
-  const uint64_t bos_token = tokenizer.bos_tok();
-  int64_t prev_end_offset = 0;
-  bool has_prev_end_offset = false;
-
   for (const auto& token : tokens) {
-    TokenizerDecodedPiece decoded =
-        decode_piece(tokenizer, bos_token, token.id);
-    const bool is_punct = is_ascii_punctuation_only(decoded.trimmed_piece());
-    const Token adjusted = apply_tdt_punctuation_timestamp_correction(
-        token, is_punct, prev_end_offset, has_prev_end_offset);
-
+    const std::string token_text = sp_decode_ids(sp, static_cast<int>(token.id));
     subwords.push_back(
-        {std::string(decoded.trimmed_piece()),
-         adjusted.start_offset,
-         adjusted.end_offset,
-         seconds_per_encoder_frame * adjusted.start_offset,
-         seconds_per_encoder_frame * adjusted.end_offset});
-
-    prev_end_offset = adjusted.end_offset;
-    has_prev_end_offset = true;
+        {token_text,
+         token.start_offset,
+         token.end_offset,
+         seconds_per_encoder_frame * token.start_offset,
+         seconds_per_encoder_frame * token.end_offset});
   }
 
   return subwords;
@@ -203,123 +205,242 @@ std::vector<TimestampedTextSpan> tokens_to_timestamped_subwords(
 
 std::vector<TimestampedTextSpan> tokens_to_timestamped_words(
     const std::vector<Token>& tokens,
-    const tokenizers::Tokenizer& tokenizer,
+    const sentencepiece::SentencePieceProcessor& sp,
+    const std::string& tokenizer_type,
+    const std::string& word_delimiter_char,
+    const std::unordered_set<std::string>& supported_punctuation,
     const double seconds_per_encoder_frame) {
-  // NeMo reference for word grouping (subword/char offsets -> word offsets):
-  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L54-L224
+  // NeMo reference: get_words_offsets().
   std::vector<TimestampedTextSpan> words;
+  if (tokens.empty()) {
+    return words;
+  }
 
-  uint64_t prev_token_id = 0;
-  std::string current_word;
-  int64_t current_start_offset = 0;
-  int64_t current_end_offset = 0;
-  int64_t prev_end_offset = 0;
-  bool has_prev_end_offset = false;
+  // Cache decoded per-token text and per-token piece (id->piece).
+  std::vector<std::string> char_texts;
+  std::vector<std::string> char_tokens;
+  char_texts.reserve(tokens.size());
+  char_tokens.reserve(tokens.size());
+  for (const auto& token : tokens) {
+    char_texts.push_back(sp_decode_ids(sp, static_cast<int>(token.id)));
+    char_tokens.push_back(sp.IdToPiece(static_cast<int>(token.id)));
+  }
 
-  auto emit_word = [&]() {
-    if (current_word.empty()) {
-      return;
-    }
-    words.push_back(
-        {std::move(current_word),
-         current_start_offset,
-         current_end_offset,
-         seconds_per_encoder_frame * current_start_offset,
-         seconds_per_encoder_frame * current_end_offset});
-    current_word.clear();
+  auto starts_with = [](const std::string& s, const std::string_view prefix) {
+    return s.size() >= prefix.size() &&
+        std::string_view(s.data(), prefix.size()) == prefix;
   };
 
-  for (const auto& token : tokens) {
-    TokenizerDecodedPiece decoded =
-        decode_piece(tokenizer, prev_token_id, token.id);
-    prev_token_id = token.id;
-    const std::string_view trimmed_piece = decoded.trimmed_piece();
-    if (trimmed_piece.empty()) {
+  auto is_word_start = [&](const std::string& token_piece,
+                           const std::string& token_text,
+                           const std::optional<std::string>& next_non_delim) {
+    const bool next_is_punct =
+        next_non_delim.has_value() &&
+        supported_punctuation.find(*next_non_delim) != supported_punctuation.end();
+    if ((tokenizer_type == "bpe" || tokenizer_type == "wpe") &&
+        word_delimiter_char == " ") {
+      if (tokenizer_type == "wpe") {
+        return (token_text.size() > 0 && !starts_with(token_text, "##")) ||
+            (token_text == word_delimiter_char && !next_is_punct);
+      }
+      return (token_piece != token_text) ||
+          (token_text == word_delimiter_char && !next_is_punct);
+    }
+    if (word_delimiter_char == " ") {
+      return token_text == word_delimiter_char && !next_is_punct;
+    }
+    return token_text == word_delimiter_char;
+  };
+
+  std::vector<std::string> built_tokens;
+  built_tokens.reserve(8);
+  size_t previous_token_index = 0;
+
+  auto finalize_word = [&](size_t start_index, size_t end_index_exclusive) {
+    if (built_tokens.empty() || end_index_exclusive == 0) {
+      return;
+    }
+    const std::string word_text = sp_decode_pieces(sp, built_tokens);
+    const int64_t start_offset = tokens[start_index].start_offset;
+    const int64_t end_offset = tokens[end_index_exclusive - 1].end_offset;
+    words.push_back(
+        {word_text,
+         start_offset,
+         end_offset,
+         seconds_per_encoder_frame * start_offset,
+         seconds_per_encoder_frame * end_offset});
+  };
+
+  for (size_t i = 0; i < tokens.size(); i++) {
+    const std::string& char_text = char_texts[i];
+    const std::string& char_token = char_tokens[i];
+
+    const bool curr_punctuation =
+        !char_text.empty() &&
+        char_text != word_delimiter_char &&
+        supported_punctuation.find(char_text) != supported_punctuation.end();
+
+    std::optional<std::string> next_non_delimiter_token = std::nullopt;
+    for (size_t j = i + 1; j < tokens.size(); j++) {
+      if (char_texts[j] != word_delimiter_char) {
+        next_non_delimiter_token = char_texts[j];
+        break;
+      }
+    }
+
+    if (is_word_start(char_token, char_text, next_non_delimiter_token) &&
+        !curr_punctuation) {
+      if (!built_tokens.empty()) {
+        finalize_word(previous_token_index, i);
+      }
+      built_tokens.clear();
+      if (char_text != word_delimiter_char) {
+        built_tokens.push_back(char_token);
+        previous_token_index = i;
+      }
       continue;
     }
 
-    const bool is_punct = is_ascii_punctuation_only(trimmed_piece);
-    const Token adjusted = apply_tdt_punctuation_timestamp_correction(
-        token, is_punct, prev_end_offset, has_prev_end_offset);
-
-    if (current_word.empty()) {
-      current_word.assign(trimmed_piece.data(), trimmed_piece.size());
-      current_start_offset = adjusted.start_offset;
-      current_end_offset = adjusted.end_offset;
-    } else if (decoded.had_leading_whitespace && !is_punct) {
-      // NeMo builds words from decoded token offsets w/ tokenizer-aware rules:
-      // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L79-L99
-      // Here, just build words per-token and separate by leading whitespace
-      emit_word();
-      current_word.assign(trimmed_piece.data(), trimmed_piece.size());
-      current_start_offset = adjusted.start_offset;
-      current_end_offset = adjusted.end_offset;
-    } else {
-      current_word.append(trimmed_piece.data(), trimmed_piece.size());
-      current_end_offset = adjusted.end_offset;
+    if (curr_punctuation && built_tokens.empty() && !words.empty()) {
+      auto& last = words.back();
+      last.end_offset = tokens[i].end_offset;
+      last.end_sec = seconds_per_encoder_frame * last.end_offset;
+      if (!last.text.empty() && last.text.back() == ' ') {
+        last.text.pop_back();
+      }
+      last.text += char_text;
+      continue;
     }
 
-    prev_end_offset = adjusted.end_offset;
-    has_prev_end_offset = true;
+    if (curr_punctuation && !built_tokens.empty()) {
+      if (built_tokens.back() == " " || built_tokens.back() == "_" ||
+          built_tokens.back() == "▁") {
+        built_tokens.pop_back();
+      }
+      built_tokens.push_back(char_token);
+      continue;
+    }
+
+    if (built_tokens.empty()) {
+      previous_token_index = i;
+    }
+    built_tokens.push_back(char_token);
   }
 
-  emit_word();
+  if (words.empty()) {
+    if (!built_tokens.empty()) {
+      const std::string word_text = sp_decode_pieces(sp, built_tokens);
+      const int64_t start_offset = tokens.front().start_offset;
+      const int64_t end_offset = tokens.back().end_offset;
+      words.push_back(
+          {word_text,
+           start_offset,
+           end_offset,
+           seconds_per_encoder_frame * start_offset,
+           seconds_per_encoder_frame * end_offset});
+    }
+  } else {
+    words[0].start_offset = tokens.front().start_offset;
+    words[0].start_sec = seconds_per_encoder_frame * words[0].start_offset;
+    if (!built_tokens.empty()) {
+      const std::string word_text = sp_decode_pieces(sp, built_tokens);
+      const int64_t start_offset = tokens[previous_token_index].start_offset;
+      const int64_t end_offset = tokens.back().end_offset;
+      words.push_back(
+          {word_text,
+           start_offset,
+           end_offset,
+           seconds_per_encoder_frame * start_offset,
+           seconds_per_encoder_frame * end_offset});
+    }
+  }
+
   return words;
 }
 
 std::vector<TimestampedTextSpan> timestamped_words_to_timestamped_segments(
     const std::vector<TimestampedTextSpan>& words,
+    const std::vector<std::string>& segment_delimiter_tokens,
+    const std::optional<int64_t>& segment_gap_threshold,
     double seconds_per_encoder_frame) {
-  // NeMo reference for segment grouping (word offsets -> segment offsets):
-  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L227-L327
+  // NeMo reference: get_segment_offsets().
   std::vector<TimestampedTextSpan> segments;
   if (words.empty()) {
     return segments;
   }
 
-  std::string current_segment;
-  int64_t segment_start_offset = 0;
-  int64_t segment_end_offset = 0;
-  bool has_segment = false;
-
-  auto emit_segment = [&]() {
-    if (!has_segment || current_segment.empty()) {
-      return;
-    }
-    segments.push_back(
-        {std::move(current_segment),
-         segment_start_offset,
-         segment_end_offset,
-         seconds_per_encoder_frame * segment_start_offset,
-         seconds_per_encoder_frame * segment_end_offset});
-    current_segment.clear();
-    has_segment = false;
-  };
-
-  for (const auto& word : words) {
-    if (!has_segment) {
-      has_segment = true;
-      current_segment = word.text;
-      segment_start_offset = word.start_offset;
-      segment_end_offset = word.end_offset;
-    } else {
-      current_segment += " ";
-      current_segment += word.text;
-      segment_end_offset = word.end_offset;
-    }
-
-    if (!word.text.empty()) {
-      char last = word.text.back();
-      // NeMo Divergence: we only segment on terminal punctuation (.,!,?) rather
-      // than configurable segment_delimiter_tokens. Also no
-      // `segment_gap_threshold` splitting.
-      if (last == '.' || last == '!' || last == '?') {
-        emit_segment();
-      }
-    }
+  std::unordered_set<std::string> delimiter_set;
+  delimiter_set.reserve(segment_delimiter_tokens.size());
+  for (const auto& d : segment_delimiter_tokens) {
+    delimiter_set.insert(d);
   }
 
-  emit_segment();
+  std::vector<std::string> segment_words;
+  segment_words.reserve(16);
+  size_t previous_word_index = 0;
+
+  auto join_words = [](const std::vector<std::string>& ws) {
+    std::string out;
+    for (size_t i = 0; i < ws.size(); i++) {
+      if (i > 0) {
+        out += " ";
+      }
+      out += ws[i];
+    }
+    return out;
+  };
+
+  auto emit_segment = [&](size_t start_word_index, size_t end_word_index) {
+    if (segment_words.empty() || start_word_index >= words.size() ||
+        end_word_index >= words.size() || end_word_index < start_word_index) {
+      return;
+    }
+    const int64_t start_offset = words[start_word_index].start_offset;
+    const int64_t end_offset = words[end_word_index].end_offset;
+    segments.push_back(
+        {join_words(segment_words),
+         start_offset,
+         end_offset,
+         seconds_per_encoder_frame * start_offset,
+         seconds_per_encoder_frame * end_offset});
+    segment_words.clear();
+  };
+
+  auto is_delimiter_word = [&](const std::string& w) {
+    if (w.empty()) {
+      return false;
+    }
+    const std::string last_char(1, w.back());
+    return delimiter_set.find(last_char) != delimiter_set.end() ||
+        delimiter_set.find(w) != delimiter_set.end();
+  };
+
+  for (size_t i = 0; i < words.size(); i++) {
+    const auto& w = words[i].text;
+    if (segment_gap_threshold.has_value() && !segment_words.empty() && i > 0) {
+      const int64_t gap = words[i].start_offset - words[i - 1].end_offset;
+      if (gap >= *segment_gap_threshold) {
+        emit_segment(previous_word_index, i - 1);
+        segment_words.push_back(w);
+        previous_word_index = i;
+        continue;
+      }
+    }
+
+    if (!w.empty() && is_delimiter_word(w)) {
+      segment_words.push_back(w);
+      emit_segment(previous_word_index, i);
+      previous_word_index = i + 1;
+      continue;
+    }
+
+    segment_words.push_back(w);
+  }
+
+  if (!segment_words.empty() && previous_word_index < words.size()) {
+    emit_segment(previous_word_index, words.size() - 1);
+  }
+
   return segments;
 }
 
@@ -743,10 +864,22 @@ int main(int argc, char** argv) {
   auto window_stride_result = model->execute("window_stride", empty_inputs);
   auto subsampling_factor_result =
       model->execute("encoder_subsampling_factor", empty_inputs);
-  if (!window_stride_result.ok() || !subsampling_factor_result.ok()) {
+  auto supported_punctuation_result =
+      model->execute("supported_punctuation", empty_inputs);
+  auto tokenizer_type_result = model->execute("tokenizer_type", empty_inputs);
+  auto word_separator_result = model->execute("word_separator", empty_inputs);
+  auto segment_separators_result =
+      model->execute("segment_separators", empty_inputs);
+  auto segment_gap_threshold_result =
+      model->execute("segment_gap_threshold", empty_inputs);
+
+  if (!window_stride_result.ok() || !subsampling_factor_result.ok() ||
+      !supported_punctuation_result.ok() || !tokenizer_type_result.ok() ||
+      !word_separator_result.ok() || !segment_separators_result.ok() ||
+      !segment_gap_threshold_result.ok()) {
     ET_LOG(
         Error,
-        "Timestamps requested (--timestamps=%s) but model metadata is missing. Re-export the model with constant_methods for window_stride and encoder_subsampling_factor.",
+        "Timestamps requested (--timestamps=%s) but model metadata is missing. Re-export the model with constant_methods for timestamp metadata.",
         FLAGS_timestamps.c_str());
     return 1;
   }
@@ -756,6 +889,37 @@ int main(int argc, char** argv) {
       subsampling_factor_result.get()[0].toInt();
   const double seconds_per_encoder_frame =
       window_stride * encoder_subsampling_factor;
+
+  const std::string supported_punctuation_str =
+      std::string(supported_punctuation_result.get()[0].toString());
+  const std::unordered_set<std::string> supported_punctuation =
+      split_lines_to_set(supported_punctuation_str);
+  const std::string tokenizer_type =
+      to_lower_ascii(std::string(tokenizer_type_result.get()[0].toString()));
+  const std::string word_separator =
+      std::string(word_separator_result.get()[0].toString());
+  const std::vector<std::string> segment_separators =
+      split_lines(segment_separators_result.get()[0].toString());
+  const int64_t segment_gap_threshold_value =
+      segment_gap_threshold_result.get()[0].toInt();
+  const std::optional<int64_t> segment_gap_threshold =
+      (segment_gap_threshold_value < 0)
+      ? std::nullopt
+      : std::optional<int64_t>(segment_gap_threshold_value);
+
+  sentencepiece::SentencePieceProcessor sp;
+  const auto sp_load_status = sp.Load(FLAGS_tokenizer_path);
+  if (!sp_load_status.ok()) {
+    ET_LOG(
+        Error,
+        "Failed to load SentencePiece model from: %s",
+        FLAGS_tokenizer_path.c_str());
+    return 1;
+  }
+
+  const std::vector<Token> corrected_tokens =
+      apply_tdt_punctuation_timestamp_correction(tokens, sp, supported_punctuation);
+
   ET_LOG(
       Info,
       "Timestamp metadata: window_stride=%f, encoder_subsampling_factor=%lld, seconds_per_encoder_frame=%f",
@@ -767,13 +931,18 @@ int main(int argc, char** argv) {
     print_timestamped_spans(
         "Subword",
         tokens_to_timestamped_subwords(
-            tokens, *tokenizer, seconds_per_encoder_frame));
+            corrected_tokens, sp, seconds_per_encoder_frame));
   }
 
   std::vector<TimestampedTextSpan> words;
   if (timestamp_mode.word || timestamp_mode.segment) {
     words = tokens_to_timestamped_words(
-        tokens, *tokenizer, seconds_per_encoder_frame);
+        corrected_tokens,
+        sp,
+        tokenizer_type,
+        word_separator,
+        supported_punctuation,
+        seconds_per_encoder_frame);
   }
   if (timestamp_mode.word) {
     print_timestamped_spans("Word", words);
@@ -782,7 +951,10 @@ int main(int argc, char** argv) {
     print_timestamped_spans(
         "Segment",
         timestamped_words_to_timestamped_segments(
-            words, seconds_per_encoder_frame));
+            words,
+            segment_separators,
+            segment_gap_threshold,
+            seconds_per_encoder_frame));
   }
 
   return 0;

@@ -353,6 +353,24 @@ def export_all(model):
     sample_rate = model.preprocessor._cfg.sample_rate
     window_stride = float(model.preprocessor._cfg.window_stride)
     encoder_subsampling_factor = int(getattr(model.encoder, "subsampling_factor", 8))
+
+    # Timestamp metadata (match NeMo defaults/behavior).
+    supported_punctuation = getattr(getattr(model, "decoding", None), "supported_punctuation", None)
+    if supported_punctuation is None:
+        from nemo.collections.asr.parts.utils.tokenizer_utils import extract_punctuation_from_vocab
+
+        supported_punctuation = extract_punctuation_from_vocab(model.tokenizer.vocab)
+
+    tokenizer_type = getattr(getattr(model, "decoding", None), "tokenizer_type", None)
+    if tokenizer_type is None:
+        from nemo.collections.asr.parts.utils.tokenizer_utils import define_spe_tokenizer_type
+
+        tokenizer_type = define_spe_tokenizer_type(model.tokenizer.vocab)
+
+    word_separator = getattr(getattr(model, "decoding", None), "word_seperator", " ")
+    segment_separators = getattr(getattr(model, "decoding", None), "segment_seperators", [".", "?", "!"])
+    segment_gap_threshold = getattr(getattr(model, "decoding", None), "segment_gap_threshold", None)
+
     metadata = {
         "num_rnn_layers": num_layers,
         "pred_hidden": pred_hidden,
@@ -362,6 +380,13 @@ def export_all(model):
         "sample_rate": sample_rate,
         "window_stride": window_stride,
         "encoder_subsampling_factor": encoder_subsampling_factor,
+        # Strings are newline-separated for easy parsing in C++.
+        "supported_punctuation": "\n".join(sorted(supported_punctuation)),
+        "tokenizer_type": tokenizer_type,
+        "word_separator": word_separator,
+        "segment_separators": "\n".join(segment_separators),
+        # Use -1 to mean "unset" (None).
+        "segment_gap_threshold": -1 if segment_gap_threshold is None else int(segment_gap_threshold),
     }
 
     return programs, metadata
