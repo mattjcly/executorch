@@ -6,14 +6,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <algorithm>
 #include <cctype>
-#include <cmath>
+#include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -57,7 +59,7 @@ struct Token {
   int64_t end_offset; // encoder frame index
 };
 
-struct TimestampedSubword {
+struct TimestampedTextSpan {
   std::string text;
   int64_t start_offset;
   int64_t end_offset;
@@ -65,23 +67,7 @@ struct TimestampedSubword {
   double end_sec;
 };
 
-struct TimestampedWord {
-  std::string text;
-  int64_t start_offset;
-  int64_t end_offset;
-  double start_sec;
-  double end_sec;
-};
-
-struct TimestampedSegment {
-  std::string text;
-  int64_t start_offset;
-  int64_t end_offset;
-  double start_sec;
-  double end_sec;
-};
-
-bool is_ascii_punctuation_only(const std::string& s) {
+bool is_ascii_punctuation_only(std::string_view s) {
   if (s.empty()) {
     return false;
   }
@@ -93,12 +79,65 @@ bool is_ascii_punctuation_only(const std::string& s) {
   return true;
 }
 
-size_t ltrim_ascii_whitespace(const std::string& s) {
+size_t ltrim_ascii_whitespace(std::string_view s) {
   size_t i = 0;
   while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) {
     i++;
   }
   return i;
+}
+
+struct DecodedPiece {
+  std::string piece;
+  size_t trimmed_offset = 0;
+  bool had_leading_whitespace = false;
+
+  std::string_view trimmed_piece() const {
+    std::string_view trimmed(piece);
+    trimmed.remove_prefix(trimmed_offset);
+    return trimmed;
+  }
+};
+
+DecodedPiece decode_piece(
+    tokenizers::Tokenizer& tokenizer,
+    uint64_t prev_token_id,
+    uint64_t token_id) {
+  auto decode_result = tokenizer.decode(prev_token_id, token_id);
+  DecodedPiece decoded;
+  decoded.piece = decode_result.ok() ? decode_result.get() : std::string();
+  decoded.trimmed_offset = ltrim_ascii_whitespace(decoded.piece);
+  decoded.had_leading_whitespace = decoded.trimmed_offset > 0;
+  return decoded;
+}
+
+TimestampedTextSpan make_timestamped_span(
+    std::string text,
+    int64_t start_offset,
+    int64_t end_offset,
+    double seconds_per_encoder_frame) {
+  return TimestampedTextSpan{
+      std::move(text),
+      start_offset,
+      end_offset,
+      seconds_per_encoder_frame * start_offset,
+      seconds_per_encoder_frame * end_offset};
+}
+
+Token apply_tdt_punctuation_timestamp_correction(
+    const Token& token,
+    bool is_punct,
+    int64_t prev_end_offset,
+    bool has_prev_end_offset) {
+  // TDT sometimes emits punctuation long after preceding token. Thus, pin
+  // timestamp to previous token. NeMo applies the same correction:
+  // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L1169-L1189
+  // Divergence: NeMo consults `supported_punctuation` from the model; here we
+  // approximate punctuation detection with `is_ascii_punctuation_only()`.
+  if (!is_punct || !has_prev_end_offset) {
+    return token;
+  }
+  return Token{token.id, prev_end_offset, prev_end_offset};
 }
 
 struct TimestampOutputMode {
@@ -171,52 +210,31 @@ bool parse_timestamp_output_mode(
   return false;
 }
 
-std::vector<TimestampedSubword> tokens_to_timestamped_subwords(
+std::vector<TimestampedTextSpan> tokens_to_timestamped_subwords(
     const std::vector<Token>& tokens,
-    tokenizers::Tokenizer* tokenizer,
+    tokenizers::Tokenizer& tokenizer,
     double seconds_per_encoder_frame) {
   // NeMo reference of TDT per-token "char" timestamp computation:
   // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L991
-  std::vector<TimestampedSubword> subwords;
-  if (!tokenizer) {
-    return subwords;
-  }
+  std::vector<TimestampedTextSpan> subwords;
+  subwords.reserve(tokens.size());
 
-  const uint64_t bos_token = tokenizer->bos_tok();
+  const uint64_t bos_token = tokenizer.bos_tok();
   int64_t prev_end_offset = 0;
   bool has_prev_end_offset = false;
 
   for (const auto& token : tokens) {
     uint64_t token_id = static_cast<uint64_t>(token.id);
-    auto decode_result = tokenizer->decode(bos_token, token_id);
+    DecodedPiece decoded = decode_piece(tokenizer, bos_token, token_id);
+    const bool is_punct = is_ascii_punctuation_only(decoded.trimmed_piece());
+    const Token adjusted = apply_tdt_punctuation_timestamp_correction(
+        token, is_punct, prev_end_offset, has_prev_end_offset);
 
-    std::string piece =
-        decode_result.ok() ? decode_result.get() : std::string();
-
-    Token adjusted = token;
-    size_t non_ws = ltrim_ascii_whitespace(piece);
-    std::string trimmed_piece = piece.substr(non_ws);
-
-    const bool is_punct = is_ascii_punctuation_only(trimmed_piece);
-    if (is_punct && has_prev_end_offset) {
-      adjusted.start_offset = prev_end_offset;
-      adjusted.end_offset = prev_end_offset;
-    }
-
-    double start_sec = -1.0;
-    double end_sec = -1.0;
-    if (seconds_per_encoder_frame > 0.0) {
-      start_sec = seconds_per_encoder_frame * adjusted.start_offset;
-      end_sec = seconds_per_encoder_frame * adjusted.end_offset;
-    }
-
-    subwords.push_back(
-        TimestampedSubword{
-            piece,
-            adjusted.start_offset,
-            adjusted.end_offset,
-            start_sec,
-            end_sec});
+    subwords.push_back(make_timestamped_span(
+        std::move(decoded.piece),
+        adjusted.start_offset,
+        adjusted.end_offset,
+        seconds_per_encoder_frame));
 
     prev_end_offset = adjusted.end_offset;
     has_prev_end_offset = true;
@@ -225,16 +243,13 @@ std::vector<TimestampedSubword> tokens_to_timestamped_subwords(
   return subwords;
 }
 
-std::vector<TimestampedWord> tokens_to_timestamped_words(
+std::vector<TimestampedTextSpan> tokens_to_timestamped_words(
     const std::vector<Token>& tokens,
-    tokenizers::Tokenizer* tokenizer,
+    tokenizers::Tokenizer& tokenizer,
     double seconds_per_encoder_frame) {
   // NeMo reference for word grouping (subword/char offsets -> word offsets):
   // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L54-L224
-  std::vector<TimestampedWord> words;
-  if (!tokenizer || tokens.empty()) {
-    return words;
-  }
+  std::vector<TimestampedTextSpan> words;
 
   uint64_t prev_token_id = 0;
 
@@ -248,63 +263,41 @@ std::vector<TimestampedWord> tokens_to_timestamped_words(
     if (current_word.empty()) {
       return;
     }
-    double start_sec = -1.0;
-    double end_sec = -1.0;
-    if (seconds_per_encoder_frame > 0.0) {
-      start_sec = seconds_per_encoder_frame * current_start_offset;
-      end_sec = seconds_per_encoder_frame * current_end_offset;
-    }
-    words.push_back(
-        TimestampedWord{
-            current_word,
-            current_start_offset,
-            current_end_offset,
-            start_sec,
-            end_sec});
+    words.push_back(make_timestamped_span(
+        std::move(current_word),
+        current_start_offset,
+        current_end_offset,
+        seconds_per_encoder_frame));
     current_word.clear();
   };
 
   for (const auto& token : tokens) {
     uint64_t token_id = static_cast<uint64_t>(token.id);
-    auto decode_result = tokenizer->decode(prev_token_id, token_id);
+    DecodedPiece decoded = decode_piece(tokenizer, prev_token_id, token_id);
     prev_token_id = token_id;
-
-    std::string piece =
-        decode_result.ok() ? decode_result.get() : std::string();
-    size_t non_ws = ltrim_ascii_whitespace(piece);
-    bool had_leading_ws = non_ws > 0;
-    std::string trimmed_piece = piece.substr(non_ws);
-
+    const std::string_view trimmed_piece = decoded.trimmed_piece();
     if (trimmed_piece.empty()) {
       continue;
     }
 
-    // TDT sometimes emits punctuation long after preceding token. Thus, pin
-    // timestamp to previous token. NeMo applies the same correction:
-    // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L1169-L1189
-    // Divergence: NeMo consults `supported_punctuation` from the model; here we
-    // approximate with `is_ascii_punctuation_only()`.
-    Token adjusted = token;
     const bool is_punct = is_ascii_punctuation_only(trimmed_piece);
-    if (is_punct && has_prev_end_offset) {
-      adjusted.start_offset = prev_end_offset;
-      adjusted.end_offset = prev_end_offset;
-    }
+    const Token adjusted = apply_tdt_punctuation_timestamp_correction(
+        token, is_punct, prev_end_offset, has_prev_end_offset);
 
     if (current_word.empty()) {
-      current_word = trimmed_piece;
+      current_word.assign(trimmed_piece.data(), trimmed_piece.size());
       current_start_offset = adjusted.start_offset;
       current_end_offset = adjusted.end_offset;
-    } else if (had_leading_ws && !is_punct) {
+    } else if (decoded.had_leading_whitespace && !is_punct) {
       // NeMo builds words from decoded token offsets w/ tokenizer-aware rules:
       // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L79-L99
       // Here, just build words per-token and separate by leading whitespace
       emit_word();
-      current_word = trimmed_piece;
+      current_word.assign(trimmed_piece.data(), trimmed_piece.size());
       current_start_offset = adjusted.start_offset;
       current_end_offset = adjusted.end_offset;
     } else {
-      current_word += trimmed_piece;
+      current_word.append(trimmed_piece.data(), trimmed_piece.size());
       current_end_offset = adjusted.end_offset;
     }
 
@@ -316,12 +309,12 @@ std::vector<TimestampedWord> tokens_to_timestamped_words(
   return words;
 }
 
-std::vector<TimestampedSegment> timestamped_words_to_timestamped_segments(
-    const std::vector<TimestampedWord>& words,
+std::vector<TimestampedTextSpan> timestamped_words_to_timestamped_segments(
+    const std::vector<TimestampedTextSpan>& words,
     double seconds_per_encoder_frame) {
   // NeMo reference for segment grouping (word offsets -> segment offsets):
   // https://github.com/NVIDIA-NeMo/NeMo/blob/bf583c9/nemo/collections/asr/parts/utils/timestamp_utils.py#L227-L327
-  std::vector<TimestampedSegment> segments;
+  std::vector<TimestampedTextSpan> segments;
   if (words.empty()) {
     return segments;
   }
@@ -335,19 +328,11 @@ std::vector<TimestampedSegment> timestamped_words_to_timestamped_segments(
     if (!has_segment || current_segment.empty()) {
       return;
     }
-    double start_sec = -1.0;
-    double end_sec = -1.0;
-    if (seconds_per_encoder_frame > 0.0) {
-      start_sec = seconds_per_encoder_frame * segment_start_offset;
-      end_sec = seconds_per_encoder_frame * segment_end_offset;
-    }
-    segments.push_back(
-        TimestampedSegment{
-            current_segment,
-            segment_start_offset,
-            segment_end_offset,
-            start_sec,
-            end_sec});
+    segments.push_back(make_timestamped_span(
+        std::move(current_segment),
+        segment_start_offset,
+        segment_end_offset,
+        seconds_per_encoder_frame));
     current_segment.clear();
     has_segment = false;
   };
@@ -604,21 +589,31 @@ std::vector<Token> greedy_decode_executorch(
 }
 
 std::string tokens_to_text(
-    const std::vector<int64_t>& tokens,
-    tokenizers::Tokenizer* tokenizer) {
+    const std::vector<Token>& tokens,
+    tokenizers::Tokenizer& tokenizer) {
   // Decode tokens to text one by one
   std::string result;
   uint64_t prev_token = 0;
-  for (size_t i = 0; i < tokens.size(); i++) {
-    uint64_t token = static_cast<uint64_t>(tokens[i]);
-    auto decode_result = tokenizer->decode(prev_token, token);
+  for (const auto& token : tokens) {
+    uint64_t token_id = static_cast<uint64_t>(token.id);
+    auto decode_result = tokenizer.decode(prev_token, token_id);
     if (decode_result.ok()) {
       result += decode_result.get();
     }
-    prev_token = token;
+    prev_token = token_id;
   }
 
   return result;
+}
+
+void print_timestamped_spans(
+    const char* label,
+    const std::vector<TimestampedTextSpan>& spans) {
+  std::cout << "\n" << label << " timestamps:\n";
+  for (const auto& span : spans) {
+    std::cout << "[" << span.start_sec << ", " << span.end_sec << "] ";
+    std::cout << span.text << "\n";
+  }
 }
 
 } // namespace
@@ -774,12 +769,7 @@ int main(int argc, char** argv) {
   }
 
   // Convert tokens to text
-  std::vector<int64_t> token_ids;
-  token_ids.reserve(tokens.size());
-  for (const auto& t : tokens) {
-    token_ids.push_back(t.id);
-  }
-  std::string text = tokens_to_text(token_ids, tokenizer.get());
+  std::string text = tokens_to_text(tokens, *tokenizer);
   std::cout << "Transcribed text: " << text << std::endl;
 
   if (timestamp_mode.enabled()) {
@@ -810,38 +800,25 @@ int main(int argc, char** argv) {
 
     std::cout << std::fixed << std::setprecision(2);
     if (timestamp_mode.subword) {
-      std::vector<TimestampedSubword> subwords = tokens_to_timestamped_subwords(
-          tokens, tokenizer.get(), seconds_per_encoder_frame);
-      std::cout << "\nSubword timestamps:\n";
-      for (const auto& sw : subwords) {
-        std::cout << "[" << sw.start_sec << ", " << sw.end_sec << "] ";
-        std::cout << sw.text << "\n";
-      }
+      print_timestamped_spans(
+          "Subword",
+          tokens_to_timestamped_subwords(
+              tokens, *tokenizer, seconds_per_encoder_frame));
     }
 
-    std::vector<TimestampedWord> words;
+    std::vector<TimestampedTextSpan> words;
     if (timestamp_mode.word || timestamp_mode.segment) {
       words = tokens_to_timestamped_words(
-          tokens, tokenizer.get(), seconds_per_encoder_frame);
-    }
-    std::vector<TimestampedSegment> segments;
-    if (timestamp_mode.segment) {
-      segments = timestamped_words_to_timestamped_segments(
-          words, seconds_per_encoder_frame);
+          tokens, *tokenizer, seconds_per_encoder_frame);
     }
     if (timestamp_mode.word) {
-      std::cout << "\nWord timestamps:\n";
-      for (const auto& w : words) {
-        std::cout << "[" << w.start_sec << ", " << w.end_sec << "] ";
-        std::cout << w.text << "\n";
-      }
+      print_timestamped_spans("Word", words);
     }
     if (timestamp_mode.segment) {
-      std::cout << "\nSegment timestamps:\n";
-      for (const auto& s : segments) {
-        std::cout << "[" << s.start_sec << ", " << s.end_sec << "] ";
-        std::cout << s.text << "\n";
-      }
+      print_timestamped_spans(
+          "Segment",
+          timestamped_words_to_timestamped_segments(
+              words, seconds_per_encoder_frame));
     }
   }
 

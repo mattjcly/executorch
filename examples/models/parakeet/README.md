@@ -71,4 +71,4 @@ From the executorch root directory:
 | `--audio_path` | Path to input audio file (.wav) |
 | `--tokenizer_path` | Path to tokenizer file (default: `tokenizer.json`) |
 | `--data_path` | Path to data file (.ptd) for delegate data (optional, required for CUDA) |
-| `--timestamps` | Print word/segment timestamps (requires `window_stride` + `encoder_subsampling_factor` in model metadata) |
+| `--timestamps` | Timestamp output mode: none\|subword\|word\|segment\|all (requires `window_stride` + `encoder_subsampling_factor` in model metadata) |
