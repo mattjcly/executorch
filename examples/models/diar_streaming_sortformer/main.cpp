@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -40,6 +41,14 @@ DEFINE_int32(
     audio_chunk_ms,
     100,
     "Audio chunk size (ms) used to simulate real-time streaming. Must be >= 100ms.");
+DEFINE_bool(
+    streaming_output,
+    true,
+    "Print diarization segments as they are committed during streaming.");
+DEFINE_bool(
+    final_summary,
+    false,
+    "Print a final sorted segment summary after processing completes (in addition to streaming output).");
 
 using ::executorch::extension::from_blob;
 using ::executorch::extension::Module;
@@ -54,6 +63,11 @@ struct Segment {
   double start_sec = 0.0;
   double end_sec = 0.0;
 };
+
+void print_segment_line(const Segment& seg) {
+  std::cout << "speaker_" << seg.speaker << "  " << seg.start_sec << "  "
+            << seg.end_sec << "\n";
+}
 
 int64_t ceil_div_int64(int64_t a, int64_t b) {
   if (b <= 0) {
@@ -306,6 +320,80 @@ class StreamingFrontend {
   int64_t holdback_frames_ = 0;
   std::vector<float> audio_tail_;
   FeatureBuffer feats_;
+};
+
+class OnlineSegmentTracker {
+ public:
+  OnlineSegmentTracker(int64_t n_spk, double frame_sec, double threshold)
+      : n_spk_(n_spk), frame_sec_(frame_sec), threshold_(threshold) {
+    if (n_spk_ <= 0) {
+      throw std::invalid_argument("OnlineSegmentTracker: n_spk must be > 0");
+    }
+    if (frame_sec_ <= 0) {
+      throw std::invalid_argument("OnlineSegmentTracker: frame_sec must be > 0");
+    }
+    in_seg_.assign(static_cast<size_t>(n_spk_), false);
+    start_frame_.assign(static_cast<size_t>(n_spk_), 0);
+  }
+
+  void process_frames(
+      const float* posteriors,
+      int64_t num_frames,
+      int64_t global_start_frame,
+      bool print_output) {
+    if (num_frames <= 0) {
+      return;
+    }
+    if (!posteriors) {
+      throw std::invalid_argument("OnlineSegmentTracker::process_frames: null posteriors");
+    }
+
+    for (int64_t t = 0; t < num_frames; ++t) {
+      const float* row = posteriors + t * n_spk_;
+      const int64_t frame_idx = global_start_frame + t;
+      for (int64_t spk = 0; spk < n_spk_; ++spk) {
+        const bool active = static_cast<double>(row[spk]) >= threshold_;
+        const size_t spk_u = static_cast<size_t>(spk);
+        if (active && !in_seg_[spk_u]) {
+          in_seg_[spk_u] = true;
+          start_frame_[spk_u] = frame_idx;
+        } else if (!active && in_seg_[spk_u]) {
+          in_seg_[spk_u] = false;
+          Segment seg;
+          seg.speaker = static_cast<int>(spk);
+          seg.start_sec = static_cast<double>(start_frame_[spk_u]) * frame_sec_;
+          seg.end_sec = static_cast<double>(frame_idx) * frame_sec_;
+          if (print_output) {
+            print_segment_line(seg);
+          }
+        }
+      }
+    }
+  }
+
+  void flush(int64_t global_end_frame, bool print_output) {
+    for (int64_t spk = 0; spk < n_spk_; ++spk) {
+      const size_t spk_u = static_cast<size_t>(spk);
+      if (!in_seg_[spk_u]) {
+        continue;
+      }
+      in_seg_[spk_u] = false;
+      Segment seg;
+      seg.speaker = static_cast<int>(spk);
+      seg.start_sec = static_cast<double>(start_frame_[spk_u]) * frame_sec_;
+      seg.end_sec = static_cast<double>(global_end_frame) * frame_sec_;
+      if (print_output) {
+        print_segment_line(seg);
+      }
+    }
+  }
+
+ private:
+  int64_t n_spk_ = 0;
+  double frame_sec_ = 0.0;
+  double threshold_ = 0.0;
+  std::vector<bool> in_seg_;
+  std::vector<int64_t> start_frame_;
 };
 
 void append_to_fixed_cache(
@@ -624,7 +712,13 @@ int main(int argc, char* argv[]) {
     cache_state.fifo.resize(
         static_cast<size_t>(fifo_max_len * emb_dim), 0.0f);
 
-    // Accumulate diar posteriors per diar frame.
+    OnlineSegmentTracker segment_tracker(n_spk, frame_sec, FLAGS_threshold);
+    if (FLAGS_streaming_output) {
+      std::cout << "Streaming segments (threshold=" << FLAGS_threshold << ")\n";
+      std::cout << std::fixed << std::setprecision(3);
+    }
+
+    // Optional: accumulate frame posteriors for a final sorted summary.
     std::vector<float> posteriors; // row-major: [T_diar, n_spk]
 
     std::vector<float> chunk_feat_buf(
@@ -632,6 +726,7 @@ int main(int argc, char* argv[]) {
 
     int64_t stt_feat = 0; // feature-frame cursor for chunk starts (no left context)
     int step_idx = 0;
+    int64_t diar_frame_cursor = 0; // global diar-frame index for streaming output
     const int64_t total_samples = static_cast<int64_t>(audio.size());
     int64_t audio_pos = 0;
 
@@ -751,14 +846,23 @@ int main(int argc, char* argv[]) {
       if (chunk_pred_len > 0) {
         const float* preds_ptr = chunk_preds.const_data_ptr<float>();
         const float* embs_ptr = chunk_embs.const_data_ptr<float>();
-        posteriors.resize(
-            posteriors.size() + static_cast<size_t>(chunk_pred_len * n_spk));
-        float* out_ptr = posteriors.data() +
-            (posteriors.size() - static_cast<size_t>(chunk_pred_len * n_spk));
-        std::memcpy(
-            out_ptr,
+        if (FLAGS_final_summary) {
+          posteriors.resize(
+              posteriors.size() + static_cast<size_t>(chunk_pred_len * n_spk));
+          float* out_ptr = posteriors.data() +
+              (posteriors.size() - static_cast<size_t>(chunk_pred_len * n_spk));
+          std::memcpy(
+              out_ptr,
+              preds_ptr,
+              static_cast<size_t>(chunk_pred_len * n_spk) * sizeof(float));
+        }
+
+        segment_tracker.process_frames(
             preds_ptr,
-            static_cast<size_t>(chunk_pred_len * n_spk) * sizeof(float));
+            chunk_pred_len,
+            diar_frame_cursor,
+            /*print_output=*/FLAGS_streaming_output);
+        diar_frame_cursor += chunk_pred_len;
 
         update_embedding_caches(
             cache_state,
@@ -813,20 +917,25 @@ int main(int argc, char* argv[]) {
       // Drain the tail.
     }
 
-    const int64_t num_diar_frames = static_cast<int64_t>(posteriors.size() / static_cast<size_t>(n_spk));
+    // Flush any open segments at end-of-stream.
+    segment_tracker.flush(
+        diar_frame_cursor, /*print_output=*/FLAGS_streaming_output);
+
+    const int64_t num_diar_frames = diar_frame_cursor;
     ET_LOG(
         Info,
         "Produced %lld diar frames (%.2f sec)",
         static_cast<long long>(num_diar_frames),
         num_diar_frames * frame_sec);
 
-    auto segments = segments_from_posteriors(
-        posteriors, num_diar_frames, n_spk, frame_sec, FLAGS_threshold);
+    if (FLAGS_final_summary) {
+      auto segments = segments_from_posteriors(
+          posteriors, num_diar_frames, n_spk, frame_sec, FLAGS_threshold);
 
-    std::cout << "Segments (threshold=" << FLAGS_threshold << ")\n";
-    for (const auto& seg : segments) {
-      std::cout << "speaker_" << seg.speaker << "  "
-                << seg.start_sec << "  " << seg.end_sec << "\n";
+      std::cout << "\nFinal segments (sorted, threshold=" << FLAGS_threshold << ")\n";
+      for (const auto& seg : segments) {
+        print_segment_line(seg);
+      }
     }
 
     return 0;
