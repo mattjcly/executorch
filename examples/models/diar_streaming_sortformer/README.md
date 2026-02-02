@@ -26,13 +26,16 @@ make diar-streaming-sortformer-cpu
 ./cmake-out/examples/models/diar_streaming_sortformer/diar_streaming_sortformer_runner \
   --model_path ./sortformer_diar_exports/model.pte \
   --audio_path /path/to/mono_16khz.wav \
-  --threshold 0.5
+  --threshold 0.5 \
+  --audio_chunk_ms 100
 ```
 
 Notes:
 - The WAV loader expects **mono** audio and does **not** resample.
 - This runner implements a simplified cache update (keeps the most recent cache frames) and does not implement
   NeMo's speaker-cache compression logic.
+- `--audio_chunk_ms` controls how much audio is fed into the ExecuTorch preprocessor per step to simulate
+  end-to-end streaming. Smaller values increase overhead; values below 100ms are rejected.
 
 
 ## Notes about difference between simplified cache and NeMo:

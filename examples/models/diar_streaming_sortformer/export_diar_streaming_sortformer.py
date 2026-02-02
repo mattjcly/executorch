@@ -232,6 +232,22 @@ def _export_programs(model, cfg: StreamingConfig, max_audio_sec: int) -> Tuple[D
 
     sample_rate = int(model._cfg.preprocessor.sample_rate)
     window_stride = float(model._cfg.preprocessor.window_stride)
+    # Preprocessor implementation details that are useful for true streaming.
+    # Expose them via constant_methods so C++ can do correct audio/frame accounting.
+    featurizer = getattr(model.preprocessor, "featurizer", None)
+    hop_length_samples = int(getattr(featurizer, "hop_length", 0)) or int(
+        round(window_stride * sample_rate)
+    )
+    win_length_samples = int(getattr(featurizer, "win_length", 0))
+    if not win_length_samples:
+        # Try common NeMo config fields. Fall back to 20ms if missing.
+        if getattr(model._cfg.preprocessor, "n_window_size", None):
+            win_length_samples = int(model._cfg.preprocessor.n_window_size)
+        elif getattr(model._cfg.preprocessor, "window_size", None):
+            win_length_samples = int(round(float(model._cfg.preprocessor.window_size) * sample_rate))
+        else:
+            win_length_samples = int(round(0.02 * sample_rate))
+    n_fft = int(getattr(featurizer, "n_fft", 0))
     subsampling_factor = int(model.encoder.subsampling_factor)
     feat_dim = int(model._cfg.preprocessor.features)
     emb_dim = int(model._cfg.sortformer_modules.fc_d_model)
@@ -300,6 +316,9 @@ def _export_programs(model, cfg: StreamingConfig, max_audio_sec: int) -> Tuple[D
     metadata = {
         "sample_rate": sample_rate,
         "window_stride": window_stride,
+        "hop_length_samples": hop_length_samples,
+        "win_length_samples": win_length_samples,
+        "n_fft": n_fft,
         "subsampling_factor": subsampling_factor,
         "feat_dim": feat_dim,
         "emb_dim": emb_dim,
@@ -352,6 +371,9 @@ def main() -> None:
         help="Max audio duration (sec) used to bound preprocessor dynamic shapes during export.",
     )
 
+    # TODO(matt): should these be exported as constants at all, or just runtime parameters?
+    #  There's a chance we'll need to export methods at a lower level..?
+
     # Streaming parameters (match NeMo examples by default)
     parser.add_argument("--spkcache-len", type=int, default=188)
     parser.add_argument("--fifo-len", type=int, default=188)
@@ -401,4 +423,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
