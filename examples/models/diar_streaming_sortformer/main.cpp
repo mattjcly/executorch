@@ -26,6 +26,9 @@
 #include <executorch/extension/tensor/tensor_ptr_maker.h>
 #include <executorch/runtime/core/evalue.h>
 #include <executorch/runtime/platform/log.h>
+#ifdef ET_BUILD_METAL
+#include <executorch/backends/apple/metal/runtime/stats.h>
+#endif
 
 DEFINE_string(model_path, "model.pte", "Path to diarization model (.pte).");
 DEFINE_string(audio_path, "", "Path to input audio file (.wav).");
@@ -937,6 +940,10 @@ int main(int argc, char* argv[]) {
         print_segment_line(seg);
       }
     }
+
+#ifdef ET_BUILD_METAL
+    executorch::backends::metal::print_metal_backend_stats();
+#endif
 
     return 0;
   } catch (const std::exception& e) {

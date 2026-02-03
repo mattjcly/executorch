@@ -47,10 +47,16 @@ set(_aoti_metal_sources
 
 add_library(metal_backend STATIC ${_aoti_metal_sources})
 target_include_directories(
-  metal_backend
-  PUBLIC $<BUILD_INTERFACE:${EXECUTORCH_ROOT}> $<INSTALL_INTERFACE:include>
-         # PyTorch AOTI headers from ExecutorTorch's torch detection
-         ${TORCH_INCLUDE_DIRS}
+        metal_backend
+        PUBLIC
+        $<BUILD_INTERFACE:${EXECUTORCH_ROOT}>
+        $<INSTALL_INTERFACE:include>
+)
+
+target_include_directories(
+        metal_backend
+        PRIVATE
+        ${TORCH_INCLUDE_DIRS}
 )
 
 # Link Metal framework

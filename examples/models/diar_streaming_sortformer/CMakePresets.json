@@ -15,6 +15,19 @@
             "name": "diar_streaming_sortformer-cpu",
             "displayName": "Streaming Sortformer diarization runner (CPU)",
             "inherits": ["diar_streaming_sortformer-base"]
+        },
+        {
+            "name": "diar_streaming_sortformer-metal",
+            "displayName": "Streaming Sortformer diarization runner (Metal)",
+            "inherits": ["diar_streaming_sortformer-base"],
+            "cacheVariables": {
+                "EXECUTORCH_BUILD_METAL": "ON"
+            },
+            "condition": {
+                "lhs": "${hostSystemName}",
+                "type": "equals",
+                "rhs": "Darwin"
+            }
         }
     ],
     "buildPresets": [
@@ -22,6 +35,12 @@
             "name": "diar_streaming_sortformer-cpu",
             "displayName": "Build Streaming Sortformer diarization runner (CPU)",
             "configurePreset": "diar_streaming_sortformer-cpu",
+            "targets": ["diar_streaming_sortformer_runner"]
+        },
+        {
+            "name": "diar_streaming_sortformer-metal",
+            "displayName": "Build Streaming Sortformer diarization runner (Metal)",
+            "configurePreset": "diar_streaming_sortformer-metal",
             "targets": ["diar_streaming_sortformer_runner"]
         }
     ],
@@ -39,7 +58,20 @@
                     "name": "diar_streaming_sortformer-cpu"
                 }
             ]
+        },
+        {
+            "name": "diar_streaming_sortformer-metal",
+            "displayName": "Configure and build Streaming Sortformer diarization runner (Metal)",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "diar_streaming_sortformer-metal"
+                },
+                {
+                    "type": "build",
+                    "name": "diar_streaming_sortformer-metal"
+                }
+            ]
         }
     ]
 }
-

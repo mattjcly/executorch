@@ -1,5 +1,5 @@
 """
-Export nvidia/diar_streaming_sortformer_4spk-v2.1 to ExecuTorch (portable ops only).
+Export nvidia/diar_streaming_sortformer_4spk-v2.1 to ExecuTorch.
 
 This exports two runtime methods into a single `model.pte`:
   - `preprocessor(audio_1d, audio_len) -> (features, features_len)`
@@ -16,12 +16,17 @@ This exports two runtime methods into a single `model.pte`:
 
 The exported program also includes constant metadata methods (via `constant_methods`) so C++
 doesn't need to hardcode model parameters.
+
+Notes:
+  - The preprocessor is always lowered with the portable backend.
+  - When `--backend metal` is selected, `model_step` is delegated to the Metal backend.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -45,6 +50,274 @@ class StreamingConfig:
     chunk_right_context: int
 
 
+@contextmanager
+def _patch_inductor_for_metal_empty_strided_workaround():
+    """Work around Inductor producing unsupported padded/odd strides.
+
+    ExecuTorch's non-ATen Tensor wrapper currently enforces a dense/permuted
+    stride invariant. AOTInductor sometimes emits `empty_strided` with padded
+    or otherwise non-dense strides for layout/padding optimizations.
+
+    Disable those optimizations during AOTInductor compilation so the generated
+    wrapper requests dense strides only.
+    """
+
+    try:
+        import torch._inductor.config as inductor_config
+    except Exception:
+        yield
+        return
+
+    changes = {
+        # Primary knobs that lead to padded/odd `empty_strided` requests.
+        "layout_optimization": False,
+        "shape_padding": False,
+        "comprehensive_padding": False,
+        "inplace_padding": False,
+        # Avoid preserving non-dense layouts across ops.
+        "keep_output_stride": False,
+        # Make padding a no-op even if any code path still consults it.
+        "padding_alignment_bytes": 1,
+        "padding_stride_threshold": 1 << 60,
+    }
+
+    filtered = {k: v for k, v in changes.items() if hasattr(inductor_config, k)}
+    if not filtered:
+        yield
+        return
+
+    print(f"  Applying torch._inductor.config patch for Metal: {filtered}")
+    with inductor_config.patch(filtered):
+        yield
+
+
+def _install_nemo_no_bool_patches() -> None:
+    """Monkey patches NeMo to avoid dtype=bool tensors during export.
+
+    ExecuTorch Metal AOTI runtime currently doesn't support allocating bool tensors
+    (and even if it did, some tensor construction/layout invariants can still abort).
+    This patch rewrites:
+      - SortformerModules.length_to_mask: returns a float 0/1 mask without lt/bool
+      - form_attention_mask: produces the same NEG_INF attention mask without bool
+      - ConformerEncoder._create_masks: produces float 0/1 masks (no bool/logical ops)
+      - MaskedConvSequential._create_mask: produces float mask without lt/bool
+      - ConformerConvolution / MultiHeadAttention: consume float masks without masked_fill(bool)
+
+    This is intended to be semantics-equivalent for this diarization model.
+    """
+
+    try:
+        from nemo.collections.asr.modules.sortformer_modules import SortformerModules
+        from nemo.collections.asr.modules.conformer_encoder import ConformerEncoder
+        from nemo.collections.asr.parts.submodules.conformer_modules import ConformerConvolution
+        from nemo.collections.asr.parts.submodules.multi_head_attention import (
+            INF_VAL as NEMO_INF_VAL,
+            MultiHeadAttention,
+        )
+        from nemo.collections.asr.parts.submodules.subsampling import MaskedConvSequential
+        from nemo.collections.common.parts import transformer_utils as nemo_transformer_utils
+        import nemo.collections.common.parts as nemo_common_parts
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "Failed to import NeMo modules required for monkey patching. "
+            "Ensure you're running the exporter in the same environment used to install NeMo."
+        ) from e
+
+    def _prefix_mask_01(length_0d: torch.Tensor, positions_1d: torch.Tensor) -> torch.Tensor:
+        # Returns an int64 vector with 1 where positions < length, else 0.
+        length_0d = length_0d.to(dtype=torch.int64)
+        positions_1d = positions_1d.to(dtype=torch.int64)
+        return torch.clamp(length_0d - positions_1d, min=0, max=1)
+
+    def _suffix_mask_01(offset_0d: torch.Tensor, positions_1d: torch.Tensor) -> torch.Tensor:
+        # Returns an int64 vector with 1 where positions >= offset, else 0.
+        offset_0d = offset_0d.to(dtype=torch.int64)
+        positions_1d = positions_1d.to(dtype=torch.int64)
+        # positions >= offset  <=>  not(positions < offset)
+        return 1 - torch.clamp(offset_0d - positions_1d, min=0, max=1)
+
+    @staticmethod
+    def length_to_mask_no_bool(lengths: torch.Tensor, max_length: int) -> torch.Tensor:
+        # Original NeMo implementation uses `<` and returns bool.
+        # Here we return a float 0/1 mask without emitting any bool ops.
+        lengths64 = lengths.to(dtype=torch.int64)
+        arange = torch.arange(max_length, device=lengths.device, dtype=torch.int64)
+        mask_01 = _prefix_mask_01(lengths64.unsqueeze(1), arange)  # broadcast to (B, L)
+        return mask_01.to(dtype=torch.float32)
+
+    def form_attention_mask_no_bool(
+        input_mask: torch.Tensor | None, diagonal: int | None = None
+    ) -> torch.Tensor | None:
+        # Mirrors nemo.collections.common.parts.transformer_utils.form_attention_mask
+        # but avoids dtype=bool (no to(bool), no &, no tril(bool)).
+        if input_mask is None:
+            return None
+
+        input_mask_f = input_mask.to(dtype=torch.float32)
+        attn_mask = input_mask_f.unsqueeze(1)  # (B, 1, L)
+        if diagonal is not None:
+            L = input_mask_f.shape[1]
+            attn_shape = (1, L, L)
+            future_mask = torch.tril(
+                torch.ones(attn_shape, dtype=torch.float32, device=input_mask.device),
+                diagonal,
+            )
+            attn_mask = attn_mask * future_mask  # (B, L, L) via broadcast
+
+        attention_mask = (1.0 - attn_mask) * nemo_transformer_utils.NEG_INF
+        return attention_mask.unsqueeze(1)
+
+    def masked_conv_create_mask_no_bool(self, tensor: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        # Original NeMo implementation uses `<` to create a bool mask, then casts to float.
+        # Build a 0/1 float mask without emitting bool ops.
+        batch_size, _, time, features = tensor.shape
+        p = torch.arange(time, device=tensor.device, dtype=torch.int64)
+        valid_01 = _prefix_mask_01(lengths.to(dtype=torch.int64).unsqueeze(1), p)  # (B, T)
+        return valid_01.unsqueeze(-1).expand(batch_size, time, features).to(dtype=tensor.dtype)
+
+    def conformer_encoder_create_masks_no_bool(
+        self,
+        att_context_size,
+        padding_length: torch.Tensor,
+        max_audio_length: int,
+        offset: torch.Tensor | None,
+        device,
+    ):
+        # Return:
+        #   pad_mask: float32 0/1 where 1 indicates padding (masked for conv)
+        #   att_mask: float32 0/1 where 1 indicates masked attention positions (B, T, T) or None
+        L = int(max_audio_length)
+        p = torch.arange(0, L, device=device, dtype=torch.int64)
+
+        valid_len_01 = _prefix_mask_01(padding_length.to(dtype=torch.int64).unsqueeze(1), p).to(
+            dtype=torch.float32
+        )  # (B, T)
+        if offset is not None:
+            valid_off_01 = _suffix_mask_01(offset.to(dtype=torch.int64).unsqueeze(1), p).to(dtype=torch.float32)
+            valid_01 = valid_len_01 * valid_off_01
+        else:
+            valid_01 = valid_len_01
+
+        pad_mask = (1.0 - valid_01).to(dtype=torch.float32)
+
+        if self.self_attention_model == "rel_pos_local_attn":
+            return pad_mask, None
+
+        # Context-visibility mask as 0/1 float (1 = visible/allowed).
+        att_allowed = torch.ones((1, L, L), device=device, dtype=torch.float32)
+
+        if self.att_context_style == "regular":
+            if att_context_size[0] >= 0:
+                att_allowed = torch.triu(att_allowed, diagonal=-att_context_size[0])
+            if att_context_size[1] >= 0:
+                att_allowed = torch.tril(att_allowed, diagonal=att_context_size[1])
+        elif self.att_context_style == "chunked_limited":
+            # Keep logic equivalent to NeMo but avoid bool comparisons/logical ops.
+            if att_context_size[1] == -1:
+                if att_context_size[0] >= 0:
+                    att_allowed = torch.triu(att_allowed, diagonal=-att_context_size[0])
+            else:
+                chunk_size = int(att_context_size[1]) + 1
+                if chunk_size <= 0:
+                    raise ValueError("chunk_size must be > 0 for chunked_limited attention")
+                if att_context_size[0] >= 0:
+                    left_chunks_num = int(att_context_size[0]) // chunk_size
+                else:
+                    left_chunks_num = 10000
+
+                chunk_idx = torch.arange(0, L, device=device, dtype=torch.int64)
+                chunk_idx = torch.div(chunk_idx, chunk_size, rounding_mode="trunc")
+                diff_chunks = chunk_idx.unsqueeze(1) - chunk_idx.unsqueeze(0)  # (T, T)
+
+                # 1 if 0 <= diff_chunks <= left_chunks_num else 0
+                ge0_01 = 1 - torch.clamp(-diff_chunks, min=0, max=1)
+                le_left_01 = 1 - torch.clamp(diff_chunks - left_chunks_num, min=0, max=1)
+                chunk_allowed = (ge0_01 * le_left_01).to(dtype=torch.float32)
+                att_allowed = att_allowed * chunk_allowed.unsqueeze(0)
+
+        # Apply padding mask to attention visibility.
+        pad_allowed = valid_01.unsqueeze(1) * valid_01.unsqueeze(2)  # (B, T, T)
+        att_allowed = att_allowed * pad_allowed  # broadcast (1, T, T) -> (B, T, T)
+        att_mask = (1.0 - att_allowed).to(dtype=torch.float32)
+        return pad_mask, att_mask
+
+    def multihead_forward_attention_no_bool(
+        self, value: torch.Tensor, scores: torch.Tensor, mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        # mask is expected to be float 0/1 with 1 indicating a masked position.
+        n_batch = value.size(0)
+        if mask is not None:
+            mask_f = mask.to(dtype=scores.dtype).unsqueeze(1)  # (B, 1, T1, T2)
+            scores = scores * (1.0 - mask_f) + mask_f * (-float(NEMO_INF_VAL))
+            attn = torch.softmax(scores, dim=-1) * (1.0 - mask_f)
+        else:
+            attn = torch.softmax(scores, dim=-1)
+
+        p_attn = self.dropout(attn)
+        x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
+        x = x.transpose(1, 2).reshape(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
+        return self.linear_out(x)
+
+    def conformer_convolution_forward_no_bool(self, x, pad_mask=None, cache=None):
+        # Equivalent to original forward, but consumes a float 0/1 pad_mask without masked_fill(bool).
+        x = x.transpose(1, 2)
+        x = self.pointwise_conv1(x)
+
+        if self.pointwise_activation == "glu_":
+            x = torch.nn.functional.glu(x, dim=1)
+        else:
+            x = self.pointwise_activation(x)
+
+        if pad_mask is not None:
+            pad_f = pad_mask.to(dtype=x.dtype).unsqueeze(1)  # (B, 1, T)
+            x = x * (1.0 - pad_f)
+
+        x = self.depthwise_conv(x, cache=cache)
+        if cache is not None:
+            x, cache = x
+
+        if self.norm_type == "layer_norm":
+            x = x.transpose(1, 2)
+            x = self.batch_norm(x)
+            x = x.transpose(1, 2)
+        else:
+            x = self.batch_norm(x)
+
+        x = self.activation(x)
+        x = self.pointwise_conv2(x)
+        x = x.transpose(1, 2)
+        if cache is None:
+            return x
+        else:
+            return x, cache
+
+    # Patch the functions used by the model.
+    SortformerModules.length_to_mask = length_to_mask_no_bool  # type: ignore[assignment]
+    nemo_transformer_utils.form_attention_mask = form_attention_mask_no_bool  # type: ignore[assignment]
+    if hasattr(nemo_common_parts, "form_attention_mask"):
+        nemo_common_parts.form_attention_mask = form_attention_mask_no_bool  # type: ignore[assignment]
+
+    MaskedConvSequential._create_mask = masked_conv_create_mask_no_bool  # type: ignore[assignment]
+    ConformerEncoder._create_masks = conformer_encoder_create_masks_no_bool  # type: ignore[assignment]
+    MultiHeadAttention.forward_attention = multihead_forward_attention_no_bool  # type: ignore[assignment]
+    ConformerConvolution.forward = conformer_convolution_forward_no_bool  # type: ignore[assignment]
+
+    # Some NeMo modules import `form_attention_mask` into their module scope.
+    # Patch those module-level references too (best-effort).
+    for mod_name in (
+        "nemo.collections.asr.modules.transformer.transformer_encoders",
+        "nemo.collections.asr.modules.transformer.transformer_encoders_nlp",
+        "nemo.collections.asr.modules.transformer.transformer_decoders",
+        "nemo.collections.asr.modules.transformer.transformer_modules",
+    ):
+        try:
+            mod = __import__(mod_name, fromlist=["form_attention_mask"])
+            if hasattr(mod, "form_attention_mask"):
+                setattr(mod, "form_attention_mask", form_attention_mask_no_bool)
+        except Exception:
+            pass
+
+
 def _load_model(model_name_or_path: str):
     try:
         from nemo.collections.asr.models.sortformer_diar_models import (
@@ -54,6 +327,9 @@ def _load_model(model_name_or_path: str):
         raise RuntimeError(
             "Failed to import NeMo. Install NeMo (or set PYTHONPATH) to use this exporter."
         ) from e
+
+    # Monkey patch NeMo to avoid bool tensor materialization during export.
+    _install_nemo_no_bool_patches()
 
     if model_name_or_path.endswith(".nemo"):
         model = SortformerEncLabelModel.restore_from(
@@ -88,6 +364,44 @@ class PreprocessorWrapper(torch.nn.Module):
         # Convert to time-major (B, T, F) for easier slicing in C++.
         feats = feats.transpose(1, 2)
         return feats, feat_len
+
+
+def _linear_bias_decomposition(input, weight, bias=None):
+    """Decompose linear with bias into matmul + add.
+
+    This avoids decompositions that can introduce reinterpret views with
+    unsupported strides in ExecuTorch, and also avoids requiring addmm.
+    """
+    weight_t = torch.ops.aten.t.default(weight)
+    out = torch.ops.aten.matmul.default(input, weight_t)
+    if bias is not None:
+        return torch.ops.aten.add.Tensor(out, bias)
+    return out
+
+
+def _create_metal_partitioners(programs: Dict) -> Tuple[Dict, Dict]:
+    """Create Metal partitioners for all programs except preprocessor."""
+    from executorch.backends.apple.metal.metal_backend import MetalBackend
+    from executorch.backends.apple.metal.metal_partitioner import MetalPartitioner
+
+    updated_programs = {}
+    for name, ep in programs.items():
+        if name == "preprocessor":
+            updated_programs[name] = ep
+            continue
+        updated_programs[name] = ep.run_decompositions(
+            {torch.ops.aten.linear.default: _linear_bias_decomposition}
+        )
+
+    partitioner = {}
+    for name in updated_programs.keys():
+        if name == "preprocessor":
+            partitioner[name] = []
+        else:
+            compile_specs = [MetalBackend.generate_method_name_compile_spec(name)]
+            partitioner[name] = [MetalPartitioner(compile_specs)]
+
+    return partitioner, updated_programs
 
 
 class SortformerStreamingStep(torch.nn.Module):
@@ -141,26 +455,29 @@ class SortformerStreamingStep(torch.nn.Module):
         chunk_len0 = chunk_pre_encode_len[0]
         total_len0 = spk_len0 + fifo_len0 + chunk_len0
 
-        p = torch.arange(self.total_max_len, device=combined.device, dtype=torch.long)
-        idx = torch.zeros_like(p)
+        # Avoid creating bool tensors (no comparisons, no where, no &).
+        p = torch.arange(self.total_max_len, device=combined.device, dtype=torch.int64)
 
-        # spkcache part
-        idx = torch.where(p < spk_len0, p, idx)
+        # Build 0/1 prefix masks using arithmetic: mask(p < k) = clamp(k - p, 0, 1)
+        spk_end = spk_len0.to(dtype=torch.int64)
+        fifo_end = (spk_len0 + fifo_len0).to(dtype=torch.int64)
+        total_end = total_len0.to(dtype=torch.int64)
 
-        # fifo part (packed immediately after spk_len0)
-        fifo_mask = (p >= spk_len0) & (p < (spk_len0 + fifo_len0))
-        fifo_src = (p - spk_len0) + self.spkcache_max_len
-        idx = torch.where(fifo_mask, fifo_src, idx)
+        m_spk = torch.clamp(spk_end - p, min=0, max=1)
+        m_spk_fifo = torch.clamp(fifo_end - p, min=0, max=1)
+        m_all = torch.clamp(total_end - p, min=0, max=1)
 
-        # chunk part (packed immediately after spk_len0 + fifo_len0)
-        chunk_mask = (p >= (spk_len0 + fifo_len0)) & (p < total_len0)
-        chunk_src = (p - spk_len0 - fifo_len0) + self.spkcache_max_len + self.fifo_max_len
-        idx = torch.where(chunk_mask, chunk_src, idx)
+        m_fifo = m_spk_fifo - m_spk
+        m_chunk = m_all - m_spk_fifo
+
+        fifo_src = (p - spk_end) + self.spkcache_max_len
+        chunk_src = (p - fifo_end) + self.spkcache_max_len + self.fifo_max_len
+        idx = (m_spk * p) + (m_fifo * fifo_src) + (m_chunk * chunk_src)
 
         idx_exp = idx.view(1, -1, 1).expand(1, -1, emb_dim)
         packed = torch.gather(combined, dim=1, index=idx_exp)
 
-        valid = (p < total_len0).view(1, -1, 1)
+        valid = m_all.to(dtype=packed.dtype).view(1, -1, 1)
         packed = packed * valid
 
         total_len = (spkcache_len + fifo_len + chunk_pre_encode_len).to(torch.int64)
@@ -208,8 +525,10 @@ class SortformerStreamingStep(torch.nn.Module):
 
         # Indices 0..chunk_len_max-1
         i = torch.arange(self.chunk_len_max, device=chunk.device, dtype=torch.long)
-        # Masks to avoid relying on dynamic slicing.
-        valid_i = (i < chunk_pred_len[0]).view(1, -1, 1)
+        # Masks to avoid relying on dynamic slicing, without emitting bool.
+        chunk_pred_len0 = chunk_pred_len[0].to(dtype=torch.int64)
+        valid_i = torch.clamp(chunk_pred_len0 - i.to(dtype=torch.int64), min=0, max=1).view(1, -1, 1)
+        valid_i = valid_i.to(dtype=preds.dtype)
 
         # Chunk embeddings used to update caches in C++: chunk_pre_encode[:, lc:lc+chunk_pred_len]
         pos_chunk = (i + lc[0]).to(torch.long)
@@ -336,23 +655,39 @@ def _export_programs(model, cfg: StreamingConfig, max_audio_sec: int) -> Tuple[D
     return programs, metadata
 
 
-def _lower_to_executorch(programs: Dict, metadata: Dict):
+def _lower_to_executorch(programs: Dict, metadata: Dict, backend: str):
     constant_methods = dict(metadata)
-    et_prog = to_edge_transform_and_lower(
-        programs,
-        partitioner=[],
-        compile_config=EdgeCompileConfig(
-            _check_ir_validity=False,
-            _skip_dim_order=True,
-        ),
-        constant_methods=constant_methods,
-    )
-    return et_prog.to_executorch(
-        config=ExecutorchBackendConfig(
-            extract_delegate_segments=False,
-            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
-        ),
-    )
+
+    if backend == "metal":
+        print("  Using Metal backend for model_step (preprocessor stays portable).")
+        partitioner, programs = _create_metal_partitioners(programs)
+        extract_delegate_segments = True
+    elif backend == "portable":
+        partitioner = []
+        extract_delegate_segments = False
+    else:
+        raise ValueError(f"Unsupported backend: {backend!r}")
+
+    with (
+        _patch_inductor_for_metal_empty_strided_workaround()
+        if backend == "metal"
+        else nullcontext()
+    ):
+        et_prog = to_edge_transform_and_lower(
+            programs,
+            partitioner=partitioner,
+            compile_config=EdgeCompileConfig(
+                _check_ir_validity=False,
+                _skip_dim_order=True,
+            ),
+            constant_methods=constant_methods,
+        )
+        return et_prog.to_executorch(
+            config=ExecutorchBackendConfig(
+                extract_delegate_segments=extract_delegate_segments,
+                memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
+            ),
+        )
 
 
 def main() -> None:
@@ -364,6 +699,13 @@ def main() -> None:
         help="NeMo model name (from_pretrained) or path to a .nemo file.",
     )
     parser.add_argument("--output-dir", type=str, default="./sortformer_diar_exports")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="portable",
+        choices=["portable", "metal"],
+        help="Backend for acceleration (default: portable).",
+    )
     parser.add_argument(
         "--max-audio-sec",
         type=int,
@@ -409,8 +751,11 @@ def main() -> None:
     print("Exporting methods...")
     programs, metadata = _export_programs(model, cfg, max_audio_sec=int(args.max_audio_sec))
 
-    print("Lowering to ExecuTorch (portable ops only)...")
-    et = _lower_to_executorch(programs, metadata)
+    if args.backend == "metal":
+        print("Lowering to ExecuTorch with Metal...")
+    else:
+        print("Lowering to ExecuTorch (portable ops only)...")
+    et = _lower_to_executorch(programs, metadata, backend=args.backend)
 
     pte_path = os.path.join(args.output_dir, "model.pte")
     with open(pte_path, "wb") as f:
