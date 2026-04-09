@@ -1,0 +1,45 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "diar_streaming_sortformer-base",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/../../../cmake-out/examples/models/diar_streaming_sortformer",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_FIND_ROOT_PATH": "${sourceDir}/../../../cmake-out",
+                "CMAKE_PREFIX_PATH": "${sourceDir}/../../../cmake-out"
+            }
+        },
+        {
+            "name": "diar_streaming_sortformer-cpu",
+            "displayName": "Streaming Sortformer diarization runner (CPU)",
+            "inherits": ["diar_streaming_sortformer-base"]
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "diar_streaming_sortformer-cpu",
+            "displayName": "Build Streaming Sortformer diarization runner (CPU)",
+            "configurePreset": "diar_streaming_sortformer-cpu",
+            "targets": ["diar_streaming_sortformer_runner"]
+        }
+    ],
+    "workflowPresets": [
+        {
+            "name": "diar_streaming_sortformer-cpu",
+            "displayName": "Configure and build Streaming Sortformer diarization runner (CPU)",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "diar_streaming_sortformer-cpu"
+                },
+                {
+                    "type": "build",
+                    "name": "diar_streaming_sortformer-cpu"
+                }
+            ]
+        }
+    ]
+}
+
